@@ -3,7 +3,7 @@ use crate::ast::{
     UnaryOp,
 };
 use crate::ast_util::{ident_var, mk_and, mk_not};
-use crate::context::{AssertionInfo, AxiomInfo, Context, ContextState, SmtSolver, ValidityResult};
+use crate::context::{AssertionInfo, AxiomInfo, Context, ContextState, SmtSolver, ValidityResult, Counterexample};
 use crate::def::{GLOBAL_PREFIX_LABEL, PREFIX_LABEL};
 use crate::messages::{ArcDynMessage, Diagnostics};
 pub use crate::model::{Model, ModelDef};
@@ -361,7 +361,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
             if context.single_check_query {
                 // one obligation: nothing to localize, report it at the query level
                 context.state = ContextState::FoundInvalid(infos, None);
-                ValidityResult::Invalid(None, None, None)
+                ValidityResult::Invalid(None, None, None, None)
             } else {
                 smt_get_model(context, infos, air_model)
             }
@@ -428,10 +428,15 @@ fn smt_get_model(
     let smt_data = context.smt_log.take_pipe_data();
     let smt_output = context.get_smt_process().send_commands(smt_data);
 
+  
+    for s in &smt_output {
+        eprintln!(">>> {}", s);
+    }
+
     if smt_output.iter().any(|line| line.contains("model is not available")) {
         // when we don't use incremental solving, sometime the model is not available when the z3 result is unknown
         context.state = ContextState::FoundInvalid(infos, None);
-        return ValidityResult::Invalid(None, None, None);
+        return ValidityResult::Invalid(None, None, None, None);
     };
 
     let model =
@@ -471,6 +476,28 @@ fn smt_get_model(
         }
     }
 
+    // Gather counterexample values they appear on models like so
+    //ModelDefX { name: "y!", params: [], ret: Int, body: "4294966061" }
+    // End in !
+    // intermediary values are like so x!1 (for now not using)
+
+    let counterexamples: Vec<Counterexample> = model_defs.iter()
+    .filter(|(_, def)| def.params.len() == 0)   // only constants (zero-arity)
+    .filter(|(name, _)| {
+        name.ends_with("!") || name.contains("@")  // params or locals
+    })
+    .filter(|(name, _)| {
+        !name.starts_with("%%")  // skip internal labels
+    })
+    .map(|(name, def)| {
+        Counterexample {var_name : name.to_string(), var_value : (*def.body).clone(), var_type : None}
+    })
+    .collect();
+
+    println!("Counterexample Values: {:?}", &counterexamples);
+    // Simple variable names appear on the model like so
+    //  ModelDefX { name: "x!", params: [], ret: Int, body: "4294966059" },
+    // variable!
     if context.debug {
         println!("Z3 model: {:?}", &model);
     }
@@ -485,7 +512,7 @@ fn smt_get_model(
     let error = discovered_error.error;
     let e = context.message_interface.append_labels(&error, &discovered_additional_info);
     context.state = ContextState::FoundInvalid(infos, Some(air_model.clone()));
-    ValidityResult::Invalid(Some(air_model), Some(e), discovered_assert_id.unwrap())
+    ValidityResult::Invalid(Some(air_model), Some(e), discovered_assert_id.unwrap(), Some(counterexamples))
 }
 
 pub(crate) fn smt_check_query<'ctx>(

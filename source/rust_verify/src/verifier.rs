@@ -878,8 +878,8 @@ impl Verifier {
                     timed_out = true;
                     break;
                 }
-                ValidityResult::Invalid(None, error, _)
-                | ValidityResult::Invalid(_, error @ None, _) => {
+                ValidityResult::Invalid(None, error, _, _)
+                | ValidityResult::Invalid(_, error @ None, _, _) => {
                     if is_first_check && level == Some(MessageLevel::Error) {
                         self.count_errors += 1;
                         invalidity = true;
@@ -898,7 +898,7 @@ impl Verifier {
                     }
                     break;
                 }
-                ValidityResult::Invalid(Some(air_model), Some(error), assert_id_opt) => {
+                ValidityResult::Invalid(Some(air_model), Some(error), assert_id_opt, counter_ex) => {
                     if let Some(assert_id) = assert_id_opt {
                         if prover_choice == vir::def::ProverChoice::DefaultProver {
                             default_prover_failed_assert_ids.push(assert_id.clone());
@@ -956,6 +956,10 @@ impl Verifier {
                                     &context.span,
                                 ).to_any());
                             }
+                        }
+
+                        if self.args.counterexample {
+                            print!("Obtained counterexamples {:?}", counter_ex);
                         }
                     }
 

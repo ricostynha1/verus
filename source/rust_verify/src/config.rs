@@ -102,6 +102,7 @@ pub struct ArgsX {
     pub ignore_unexpected_smt: bool,
     pub allow_inline_air: bool,
     pub debugger: bool,
+    pub counterexample : bool,
     pub profile: bool,
     pub profile_all: bool,
     pub capture_profiles: bool,
@@ -149,6 +150,7 @@ impl ArgsX {
             ignore_unexpected_smt: Default::default(),
             allow_inline_air: Default::default(),
             debugger: Default::default(),
+            counterexample: Default::default(),
             profile: Default::default(),
             profile_all: Default::default(),
             capture_profiles: Default::default(),
@@ -398,6 +400,7 @@ pub fn parse_args_with_imports(
     const OPT_NO_REPORT_LONG_RUNNING: &str = "no-report-long-running";
 
     const OPT_EXTENDED_MULTI: &str = "V";
+    const OPT_COUNTEREXAMPLE: &str = "counterexample";
     const EXTENDED_IGNORE_UNEXPECTED_SMT: &str = "ignore-unexpected-smt";
     const EXTENDED_DEBUG: &str = "debug";
     const EXTENDED_NO_SOLVER_VERSION_CHECK: &str = "no-solver-version-check";
@@ -588,6 +591,11 @@ pub fn parse_args_with_imports(
         .as_str(),
         "OPTION[=VALUE]",
     );
+    opts.optflag(
+        "",
+        OPT_COUNTEREXAMPLE,
+        "Emit counterexamples",
+    );
 
     let print_usage = || {
         let brief = format!("Usage: {} INPUT [options]", program);
@@ -775,6 +783,7 @@ pub fn parse_args_with_imports(
         ignore_unexpected_smt: extended.contains_key(EXTENDED_IGNORE_UNEXPECTED_SMT),
         allow_inline_air: extended.contains_key(EXTENDED_ALLOW_INLINE_AIR),
         debugger: extended.contains_key(EXTENDED_DEBUG),
+        counterexample: matches.opt_present(OPT_COUNTEREXAMPLE),
         profile: {
             if matches.opt_present(OPT_PROFILE) {
                 if matches.opt_present(OPT_PROFILE_ALL) {

@@ -43,9 +43,16 @@ pub enum UsageInfo {
 }
 
 #[derive(Debug)]
+pub struct Counterexample {
+    pub var_name : String,
+    pub var_value : String,
+    pub var_type : Option<String>, // For now option untill be able to parse it
+}
+
+#[derive(Debug)]
 pub enum ValidityResult {
     Valid(UsageInfo),
-    Invalid(Option<Model>, Option<ArcDynMessage>, Option<AssertId>),
+    Invalid(Option<Model>, Option<ArcDynMessage>, Option<AssertId>, Option<Vec<Counterexample>>),
     Canceled,
     TypeError(TypeError),
     UnexpectedOutput(String),

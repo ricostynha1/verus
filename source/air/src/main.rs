@@ -164,11 +164,11 @@ pub fn main() {
             ValidityResult::TypeError(err) => {
                 panic!("Type error: {}", err);
             }
-            ValidityResult::Invalid(_m, None, _assert_id) => {
+            ValidityResult::Invalid(_m, None, _assert_id, _cnt) => {
                 count_errors += 1;
                 println!("Error at unknown location");
             }
-            ValidityResult::Invalid(_m, Some(err), _assert_id) => {
+            ValidityResult::Invalid(_m, Some(err), _assert_id, _cnt) => {
                 count_errors += 1;
                 let err: &AirMessage =
                     err.downcast_ref().expect("unexpected value in Any -> Message conversion");
