@@ -428,9 +428,10 @@ fn smt_get_model(
     let smt_data = context.smt_log.take_pipe_data();
     let smt_output = context.get_smt_process().send_commands(smt_data);
 
-  
-    for s in &smt_output {
-        eprintln!(">>> {}", s);
+    if context.debug {
+        for s in &smt_output {
+            eprintln!(">>> {}", s);
+        }
     }
 
     if smt_output.iter().any(|line| line.contains("model is not available")) {
@@ -494,7 +495,6 @@ fn smt_get_model(
     })
     .collect();
 
-    println!("Counterexample Values: {:?}", &counterexamples);
     // Simple variable names appear on the model like so
     //  ModelDefX { name: "x!", params: [], ret: Int, body: "4294966059" },
     // variable!

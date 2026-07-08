@@ -39,6 +39,7 @@ mod boundary_suggestions;
 pub mod cargo_verus;
 pub mod cargo_verus_dep_tracker;
 pub mod context;
+pub mod counterexample_codegen;
 pub mod debugger;
 pub mod def;
 pub mod driver;

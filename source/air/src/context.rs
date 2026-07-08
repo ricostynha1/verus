@@ -42,7 +42,7 @@ pub enum UsageInfo {
     UsedAxioms(Vec<Ident>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Counterexample {
     pub var_name : String,
     pub var_value : String,

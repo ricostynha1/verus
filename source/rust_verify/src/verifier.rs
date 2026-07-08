@@ -435,6 +435,7 @@ struct RunCommandQueriesResult {
     timed_out: bool,
     not_skipped: bool,
     used_axioms: Option<Vec<air::ast::Ident>>,
+    counterexamples: Option<Vec<air::context::Counterexample>>,
 }
 
 impl std::ops::Add for RunCommandQueriesResult {
@@ -450,6 +451,12 @@ impl std::ops::Add for RunCommandQueriesResult {
                 (None, Some(u)) => Some(u),
                 (None, None) => None,
                 (Some(_), Some(_)) => panic!("only the primary query should contain used_axioms"),
+            },
+            counterexamples: match (self.counterexamples, rhs.counterexamples) {
+                (Some(c), None) => Some(c),
+                (None, Some(c)) => Some(c),
+                (None, None) => None,
+                (Some(c), Some(_)) => Some(c), // keep first
             },
         }
     }
@@ -839,6 +846,7 @@ impl Verifier {
         let mut invalidity = false;
         let mut timed_out = false;
         let mut used_axioms = None;
+        let mut captured_counterexamples: Option<Vec<air::context::Counterexample>> = None;
         loop {
             match result {
                 ValidityResult::Valid(usage_info) => {
@@ -959,7 +967,16 @@ impl Verifier {
                         }
 
                         if self.args.counterexample {
-                            print!("Obtained counterexamples {:?}", counter_ex);
+                            if let Some(ref cex_values) = counter_ex {
+                                eprintln!("\n=== Counterexample ===");
+                                eprintln!("Function: {:?}", context.fun);
+                                for cex in cex_values {
+                                    let clean_name = cex.var_name.trim_end_matches('!');
+                                    eprintln!("  {} = {}", clean_name, cex.var_value);
+                                }
+                                eprintln!("======================\n");
+                                captured_counterexamples = counter_ex.clone();
+                            }
                         }
                     }
 
@@ -1010,6 +1027,7 @@ impl Verifier {
             invalidity,
             timed_out,
             not_skipped: matches!(**command, CommandX::CheckValid(_)),
+            counterexamples: captured_counterexamples,
         }
     }
 
@@ -1079,6 +1097,7 @@ impl Verifier {
                 timed_out: false,
                 not_skipped: false,
                 used_axioms: None,
+                counterexamples: None,
             };
         }
 
@@ -1087,6 +1106,7 @@ impl Verifier {
             timed_out: false,
             not_skipped: false,
             used_axioms: None,
+            counterexamples: None,
         };
         let CommandsWithContextX {
             context,
@@ -1612,6 +1632,7 @@ impl Verifier {
                                 timed_out: command_timed_out,
                                 not_skipped: command_not_skipped,
                                 used_axioms: command_used_axioms,
+                                counterexamples: command_counterexamples,
                             } = self.run_commands_queries(
                                 reporter,
                                 source_map,
@@ -1627,6 +1648,75 @@ impl Verifier {
                                 None,
                                 &mut default_prover_failed_assert_ids,
                             );
+
+                            // Generate counterexample test file if we have counterexamples
+                            if self.args.counterexample {
+                                if let Some(ref cex_values) = command_counterexamples {
+                                    if let Some(source_path) = crate::counterexample_codegen::file_path_from_span(&function.span.as_string) {
+                                        match crate::counterexample_codegen::generate_test_file(
+                                            function,
+                                            cex_values,
+                                            &source_path,
+                                        ) {
+                                            Ok((out_path, content)) => {
+                                                if let Err(e) = std::fs::write(&out_path, &content) {
+                                                    eprintln!("counterexample codegen: write error: {:?}", e);
+                                                } else {
+                                                    eprintln!("counterexample test generated: {:?}", out_path);
+                                                    // Compile and run the generated test
+                                                    if let Ok(verus_exe) = std::env::current_exe() {
+                                                        let compile_result = std::process::Command::new(&verus_exe)
+                                                            .arg("--compile")
+                                                            .arg(&out_path)
+                                                            .output();
+                                                        match compile_result {
+                                                            Ok(output) if output.status.success() => {
+                                                                // rustc puts binary in CWD with file stem as name
+                                                                let bin_name = out_path.file_stem().unwrap_or_default();
+                                                                let bin_path = std::env::current_dir()
+                                                                    .unwrap_or_default()
+                                                                    .join(bin_name);
+                                                                let run_result = std::process::Command::new(&bin_path)
+                                                                    .output();
+                                                                match run_result {
+                                                                    Ok(run_out) => {
+                                                                        let stderr = String::from_utf8_lossy(&run_out.stderr);
+                                                                        let stdout = String::from_utf8_lossy(&run_out.stdout);
+                                                                        if !stderr.is_empty() {
+                                                                            eprintln!("\n=== Counterexample Classification ===");
+                                                                            eprintln!("{}", stderr.trim());
+                                                                            eprintln!("=====================================");
+                                                                        } else if !stdout.is_empty() {
+                                                                            eprintln!("\n=== Counterexample Classification ===");
+                                                                            eprintln!("{}", stdout.trim());
+                                                                            eprintln!("=====================================");
+                                                                        }
+                                                                        // Clean up binary
+                                                                        let _ = std::fs::remove_file(&bin_path);
+                                                                    }
+                                                                    Err(e) => {
+                                                                        eprintln!("counterexample run error: {:?}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Ok(output) => {
+                                                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                                                eprintln!("counterexample compile failed:\n{}", stderr);
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("counterexample compile error: {:?}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("counterexample codegen error: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             func_curr_smt_time +=
                                 query_air_context.get_time().1 - iter_curr_smt_time;
                             if let Some(func_curr_smt_rlimit_count) =
