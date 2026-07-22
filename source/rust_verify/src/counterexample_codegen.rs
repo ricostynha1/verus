@@ -110,7 +110,16 @@ fn extract_source_parts(source: &str, fn_name: &str) -> Option<SourceParts> {
     let mut in_ensures = false;
 
     for i in (fn_line_idx + 1)..lines.len() {
-        let trimmed = lines[i].trim();
+        // Strip line comments so `// ...` notes inside the requires/ensures
+        // clauses don't get folded into (and comment out) the spec expression.
+        let line = match lines[i].find("//") {
+            Some(c) => &lines[i][..c],
+            None => lines[i],
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
         if trimmed.starts_with("requires") {
             in_requires = true;
@@ -349,6 +358,331 @@ fn match_counterexamples(
         .collect()
 }
 
+/// If `typ_str` is `Vec<T>`, return `T`. Vec params are the only composite
+/// type the codegen currently handles.
+fn vec_elem(typ_str: &str) -> Option<&str> {
+    typ_str.strip_prefix("Vec<").and_then(|s| s.strip_suffix('>')).map(|s| s.trim())
+}
+
+/// Spec-mode type for a param. Spec code cannot mention `Vec`; the Verus idiom
+/// is to write contracts over the `Seq` view (`v@`). So a `Vec<T>` exec param
+/// becomes a `Seq<T>` spec param.
+fn spec_param_type(typ_str: &str) -> String {
+    match vec_elem(typ_str) {
+        Some(elem) => format!("Seq<{}>", elem),
+        None => typ_str.to_string(),
+    }
+}
+
+/// Remove the Verus view operator: `name@` -> `name`, for the given names.
+/// Once a Vec param is retyped as its `Seq` view, `v@` in the source contract
+/// (which was `Vec::view`) is just the parameter itself. Longer names first so
+/// e.g. `new_v@` is handled before `v@` would match its suffix.
+fn strip_view_ops(text: &str, names: &[String]) -> String {
+    let mut ordered = names.to_vec();
+    ordered.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out = text.to_string();
+    for n in &ordered {
+        out = out.replace(&format!("{}@", n), n);
+    }
+    out
+}
+
+/// Join top-level (paren/bracket-depth 0) comma-separated clauses with `&&`.
+/// Verus writes multiple requires/ensures as comma-separated conjuncts, but a
+/// spec fn body must be a single boolean expression. Commas inside call
+/// arguments (e.g. `upper_bound(v, 10)`) are left untouched.
+fn commas_to_and(text: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0i32;
+    for ch in text.chars() {
+        match ch {
+            '(' | '[' | '{' => {
+                depth += 1;
+                out.push(ch);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                out.push(ch);
+            }
+            ',' if depth == 0 => out.push_str(" && "),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// A spec fn definition extracted verbatim from the source.
+struct SpecFnRaw {
+    name: String,
+    params: String,
+    ret: String,
+    body: String,
+}
+
+/// Extract `spec fn <name>(params) -> ret { body }` from the source, matching
+/// parentheses and braces so nested calls/blocks are handled.
+fn extract_spec_fn(source: &str, name: &str) -> Option<SpecFnRaw> {
+    let needle = format!("spec fn {}", name);
+    let start = source.find(&needle)?;
+    let after = &source[start + needle.len()..];
+
+    // Parameter list: from '(' to its matching ')'.
+    let popen = after.find('(')?;
+    let bytes = after.as_bytes();
+    let (mut depth, mut i, mut pclose) = (0i32, popen, None);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    pclose = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let pclose = pclose?;
+    let params = after[popen + 1..pclose].trim().to_string();
+
+    // Return type: between ')' and the body's '{'.
+    let rest = &after[pclose + 1..];
+    let bopen = rest.find('{')?;
+    let ret = rest[..bopen].trim().trim_start_matches("->").trim().to_string();
+
+    // Body: from '{' to its matching '}'.
+    let rbytes = rest.as_bytes();
+    let (mut d, mut j, mut bclose) = (0i32, bopen, None);
+    while j < rbytes.len() {
+        match rbytes[j] {
+            b'{' => d += 1,
+            b'}' => {
+                d -= 1;
+                if d == 0 {
+                    bclose = Some(j);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    let bclose = bclose?;
+    let body = rest[bopen + 1..bclose].trim().to_string();
+
+    Some(SpecFnRaw { name: name.to_string(), params, ret, body })
+}
+
+/// Collect identifiers used in call position (`foo(`), excluding method calls
+/// (`.foo(`) and quantifier keywords.
+fn called_idents(expr: &str) -> Vec<String> {
+    let bytes = expr.as_bytes();
+    let mut res = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let s = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let mut k = i;
+            while k < bytes.len() && bytes[k] == b' ' {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                let prev = if s > 0 { bytes[s - 1] } else { b' ' };
+                if prev != b'.' {
+                    let id = &expr[s..i];
+                    if !matches!(id, "forall" | "exists" | "vec") {
+                        res.push(id.to_string());
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    res
+}
+
+/// Find the spec fns (transitively) referenced by the given expressions and
+/// present in the source. Order within the returned list does not matter — the
+/// generated exec fns may reference each other regardless of position.
+fn referenced_spec_fns(source: &str, exprs: &[&str]) -> Vec<SpecFnRaw> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = exprs.iter().flat_map(|e| called_idents(e)).collect();
+    let mut found = Vec::new();
+    while let Some(name) = queue.pop() {
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.insert(name.clone());
+        if let Some(def) = extract_spec_fn(source, &name) {
+            queue.extend(called_idents(&def.body));
+            found.push(def);
+        }
+    }
+    found
+}
+
+/// Split a spec-code expression at the top-level occurrences of `sep`.
+fn split_top_level<'a>(expr: &'a str, sep: &str) -> Vec<&'a str> {
+    let bytes = expr.as_bytes();
+    let sbytes = sep.as_bytes();
+    let mut parts = Vec::new();
+    let (mut depth, mut i, mut last) = (0i32, 0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && expr[i..].as_bytes().starts_with(sbytes) {
+            parts.push(&expr[last..i]);
+            i += sbytes.len();
+            last = i;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&expr[last..]);
+    parts
+}
+
+/// Rewrite a single range guard so every quantified variable is bounded on both
+/// sides, as `exec_spec_unverified!` requires. A monotone chain like
+/// `0 <= i <= j < v.len()` becomes `0 <= i < v.len() && i <= j < v.len()`.
+/// Conjuncts that are not such chains are left unchanged.
+fn normalize_range_guard(guard: &str, vars: &[String]) -> String {
+    let ops = ["<=", ">=", "<", ">"];
+    split_top_level(guard, "&&")
+        .into_iter()
+        .map(|conj| {
+            let conj = conj.trim();
+            // Tokenize into terms separated by top-level relational ops.
+            let bytes = conj.as_bytes();
+            let (mut depth, mut i, mut last) = (0i32, 0usize, 0usize);
+            let mut terms: Vec<String> = Vec::new();
+            let mut chain_ops: Vec<&str> = Vec::new();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    if let Some(op) = ops.iter().find(|op| conj[i..].starts_with(**op)) {
+                        terms.push(conj[last..i].trim().to_string());
+                        chain_ops.push(op);
+                        i += op.len();
+                        last = i;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            terms.push(conj[last..].trim().to_string());
+
+            // Need >= 2 ops (>= 3 terms) and every interior term a quant var.
+            let interior = &terms[1..terms.len().saturating_sub(1)];
+            let is_chain = chain_ops.len() >= 2
+                && !interior.is_empty()
+                && interior.iter().all(|t| vars.iter().any(|v| v == t));
+            if !is_chain {
+                return conj.to_string();
+            }
+            let k = terms.len() - 1;
+            let upper = &terms[k];
+            let upper_op = chain_ops[k - 1];
+            (1..k)
+                .map(|t| {
+                    format!("{} {} {} {} {}", terms[t - 1], chain_ops[t - 1], terms[t], upper_op, upper)
+                })
+                .collect::<Vec<_>>()
+                .join(" && ")
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+/// Normalize a spec-fn body containing a single leading `forall`/`exists`
+/// quantifier into a form `exec_spec_unverified!` accepts: quantified vars get a
+/// concrete `usize` type, range guards are split per-variable, and `Seq`
+/// indexing by a quantified var gets the required `as int` cast (`v[i]` ->
+/// `v[i as int]`). Bodies that are not a single quantifier are returned as-is.
+fn normalize_quantifier_body(body: &str) -> String {
+    let body = body.trim();
+    let kind = if body.starts_with("forall") {
+        "forall"
+    } else if body.starts_with("exists") {
+        "exists"
+    } else {
+        return body.to_string();
+    };
+
+    let rest = body[kind.len()..].trim_start();
+    if !rest.starts_with('|') {
+        return body.to_string();
+    }
+    let close = match rest[1..].find('|') {
+        Some(c) => c + 1,
+        None => return body.to_string(),
+    };
+    let decls = &rest[1..close];
+    let tail = rest[close + 1..].trim_start();
+    // Drop an optional trigger annotation `#![ ... ]`.
+    let tail = if let Some(t) = tail.strip_prefix("#![") {
+        match t.find(']') {
+            Some(end) => t[end + 1..].trim_start(),
+            None => tail,
+        }
+    } else {
+        tail
+    };
+
+    // Quantified variable names, with their types forced to usize.
+    let mut vars = Vec::new();
+    let new_decls = decls
+        .split(',')
+        .map(|d| {
+            let name = d.split(':').next().unwrap_or("").trim().to_string();
+            if !name.is_empty() {
+                vars.push(name.clone());
+            }
+            format!("{}: usize", name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // forall: `guard ==> consequent`; exists: `guard && body`.
+    let sep = if kind == "forall" { "==>" } else { "&&" };
+    let split = split_top_level(tail, sep);
+    let (guard, consequent) = if split.len() >= 2 {
+        (split[0].trim().to_string(), split[1..].join(sep).trim().to_string())
+    } else {
+        (String::new(), tail.trim().to_string())
+    };
+
+    let mut new_guard = normalize_range_guard(&guard, &vars);
+    let mut new_consequent = consequent;
+    // Seq indexing by a quantified var needs an `int` index.
+    for v in &vars {
+        let from = format!("[{}]", v);
+        let to = format!("[{} as int]", v);
+        new_guard = new_guard.replace(&from, &to);
+        new_consequent = new_consequent.replace(&from, &to);
+    }
+
+    if guard.is_empty() {
+        format!("{} |{}| {}", kind, new_decls, new_consequent)
+    } else {
+        format!("{} |{}| {} {} {}", kind, new_decls, new_guard, sep, new_consequent)
+    }
+}
+
 /// Generate the counterexample test file content.
 pub fn generate_test_file(
     function: &FunctionSst,
@@ -370,26 +704,47 @@ pub fn generate_test_file(
         return Err("no counterexample values matched function params".to_string());
     }
 
-    // Build param list strings
+    // Exec-mode signature (function under test): keeps the real types (Vec<T>).
     let params_sig: String = params
         .iter()
         .map(|p| format!("{}: {}", p.name, p.typ_str))
         .collect::<Vec<_>>()
         .join(", ");
 
-    let _params_names: String = params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
-
-    let params_with_ret: String = {
-        let mut v: Vec<String> = params.iter().map(|p| format!("{}: {}", p.name, p.typ_str)).collect();
-        v.push(format!("{}: {}", ret.name, ret.typ_str));
+    // Spec-mode signatures: Vec params become their Seq view type.
+    let spec_params_sig: String = params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, spec_param_type(&p.typ_str)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let spec_params_with_ret: String = {
+        let mut v: Vec<String> =
+            params.iter().map(|p| format!("{}: {}", p.name, spec_param_type(&p.typ_str))).collect();
+        v.push(format!("{}: {}", ret.name, spec_param_type(&ret.typ_str)));
         v.join(", ")
     };
 
-    let params_names_with_ret: String = {
-        let mut v: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-        v.push(ret.name.clone());
-        v.join(", ")
-    };
+    // Names of Vec-typed params/ret — these need view (`@`)/reference handling.
+    let vec_names: Vec<String> = params
+        .iter()
+        .chain(std::iter::once(&ret))
+        .filter(|p| vec_elem(&p.typ_str).is_some())
+        .map(|p| p.name.clone())
+        .collect();
+
+    // Args passed to `_ensures` from the external_body fn: Vec args as views.
+    let ensures_view_args: String = params
+        .iter()
+        .chain(std::iter::once(&ret))
+        .map(|p| {
+            if vec_elem(&p.typ_str).is_some() {
+                format!("{}@", p.name)
+            } else {
+                p.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
 
     // Generate output path
     let stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
@@ -411,27 +766,46 @@ pub fn generate_test_file(
         ret.name,
         ret.typ_str,
         fn_name,
-        params_names_with_ret,
+        ensures_view_args,
         parts.body_text,
     ));
 
-    // Fix up ensures text for exec-mode type correctness
-    let ensures_exec = fixup_ensures_for_exec(&parts.ensures_text, &ret, &params);
+    // Rewrite the contract text into spec-fn bodies:
+    // strip view ops on Vec params (now Seq-typed), join comma clauses, and for
+    // ensures apply the exec-mode integer-promotion cast.
+    let requires_body = expand_chained_inequalities(&commas_to_and(&strip_view_ops(
+        &parts.requires_text,
+        &vec_names,
+    )));
+    let ensures_stripped = strip_view_ops(&parts.ensures_text, &vec_names);
+    let ensures_body = expand_chained_inequalities(&commas_to_and(&fixup_ensures_for_exec(
+        &ensures_stripped,
+        &ret,
+        &params,
+    )));
 
-    // Expand chained inequalities for compatibility with standard Rust parsing
-    // (exec_spec_unverified! doesn't use Verus's custom parser)
-    let requires_expanded = expand_chained_inequalities(&parts.requires_text);
-    let ensures_expanded = expand_chained_inequalities(&ensures_exec);
+    // Helper spec fns referenced by the contract must also be emitted (with
+    // exec-compatible quantifiers) so the macro can generate their exec versions.
+    let helpers = referenced_spec_fns(&source, &[requires_body.as_str(), ensures_body.as_str()]);
 
     // exec_spec_unverified! block
     out.push_str("exec_spec_unverified! {\n");
+    for h in &helpers {
+        out.push_str(&format!(
+            "    spec fn {}({}) -> {} {{\n        {}\n    }}\n\n",
+            h.name,
+            h.params,
+            h.ret,
+            normalize_quantifier_body(&h.body)
+        ));
+    }
     out.push_str(&format!(
         "    spec fn {}_requires({}) -> bool {{\n        {}\n    }}\n\n",
-        fn_name, params_sig, requires_expanded
+        fn_name, spec_params_sig, requires_body
     ));
     out.push_str(&format!(
         "    spec fn {}_ensures({}) -> bool {{\n        {}\n    }}\n",
-        fn_name, params_with_ret, ensures_expanded
+        fn_name, spec_params_with_ret, ensures_body
     ));
     out.push_str("}\n\n");
 
@@ -446,20 +820,39 @@ pub fn generate_test_file(
     }
     out.push_str("\n");
 
-    // catch_unwind block
-    let params_clone: String = params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ");
+    // Call-site argument lists. Exec spec fns take the Seq view by reference
+    // (`&v` for a Vec), while the function under test consumes the owned Vec, so
+    // it gets a clone to keep the value available for the ensures check.
+    let arg = |p: &ParamInfo, by_ref: bool| -> String {
+        match (vec_elem(&p.typ_str).is_some(), by_ref) {
+            (true, true) => format!("&{}", p.name),
+            (true, false) => format!("{}.clone()", p.name),
+            (false, _) => p.name.clone(),
+        }
+    };
+    let requires_args: String =
+        params.iter().map(|p| arg(p, true)).collect::<Vec<_>>().join(", ");
+    let call_args: String =
+        params.iter().map(|p| arg(p, false)).collect::<Vec<_>>().join(", ");
+    let ensures_args: String = params
+        .iter()
+        .chain(std::iter::once(&ret))
+        .map(|p| arg(p, true))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     out.push_str("    let run_result = std::panic::catch_unwind(|| {\n");
     out.push_str(&format!(
         "        let preconds_hold = exec_{}_requires({});\n",
-        fn_name, params_clone
+        fn_name, requires_args
     ));
     out.push_str(&format!(
         "        let {} = {}({});\n",
-        ret.name, fn_name, params_clone
+        ret.name, fn_name, call_args
     ));
     out.push_str(&format!(
         "        let ensures_holds = exec_{}_ensures({});\n",
-        fn_name, params_names_with_ret
+        fn_name, ensures_args
     ));
     out.push_str(&format!(
         "        (preconds_hold, {}, ensures_holds)\n",
