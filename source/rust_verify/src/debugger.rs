@@ -154,14 +154,14 @@ impl Debugger {
         println!("{}", result);
     }
 
-    pub fn start_shell(&mut self, context: &mut air::context::Context) {
+    pub fn start_shell(&mut self, _context: &mut air::context::Context) {
         println!("welcome to verus debugger shell");
 
-        self.set_line(26);
+        //self.set_line(26);
 
-        self.eval_expr(context, b"x");
+        //self.eval_expr(context, b"x");
         // self.eval_expr(context, b"y");
-        self.eval_expr(context, b"(add_one x)");
+        //self.eval_expr(context, b"(add_one x)");
         // self.eval_expr(context, b"(add_one (add_one x))");
     }
 }

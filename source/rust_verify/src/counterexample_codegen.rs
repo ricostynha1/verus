@@ -4,7 +4,7 @@
 
 use air::context::Counterexample;
 use std::path::{Path, PathBuf};
-use vir::ast::{IntRange, Typ, TypX, VarIdent};
+use vir::ast::{Dt, IntRange, Typ, TypX, VarIdent};
 use vir::sst::FunctionSst;
 
 /// Extract file path from a VIR span's as_string field.
@@ -39,6 +39,14 @@ fn typ_to_rust_string(typ: &Typ) -> String {
             IntRange::ISize => "isize".to_string(),
             IntRange::Char => "char".to_string(),
         },
+        // Vec<T> is a datatype whose path ends in "Vec"; render its element type.
+        TypX::Datatype(Dt::Path(path), targs, _) => {
+            let is_vec = path.segments.last().map(|s| s.as_str()) == Some("Vec");
+            match (is_vec, targs.first()) {
+                (true, Some(elem)) => format!("Vec<{}>", typ_to_rust_string(elem)),
+                _ => "/* unsupported type */".to_string(),
+            }
+        }
         _ => "/* unsupported type */".to_string(),
     }
 }
@@ -213,6 +221,110 @@ fn fixup_ensures_for_exec(
     }
 }
 
+/// Transform chained inequalities like "0 < a < 1000" into "(0 < a) && (a < 1000)"
+/// for compatibility with standard Rust parsing in exec_spec_unverified!
+fn expand_chained_inequalities(expr: &str) -> String {
+    let ops = ["<=", ">=", "==", "!=", "<", ">"];
+    let mut result = expr.to_string();
+    let mut changed = true;
+    
+    while changed {
+        changed = false;
+        
+        for (i, _) in result.char_indices() {
+            let slice = &result[i..];
+            
+            // 1. Find the first operator
+            let mut found_op1 = None;
+            for op in ops {
+                if slice.starts_with(op) {
+                    found_op1 = Some(op);
+                    break;
+                }
+            }
+            
+            if let Some(op1) = found_op1 {
+                let left = &result[..i];
+                let rest1 = &result[i + op1.len()..];
+                
+                // Isolate the left expression from any previous logic (like && or ||)
+                let mut left_start = 0;
+                for (k, c) in left.char_indices().rev() {
+                    if c == '&' || c == '|' || c == ',' || c == ';' || c == '=' || c == '(' || c == '[' || c == '{' {
+                        left_start = k + c.len_utf8();
+                        break;
+                    }
+                }
+                let prefix = &left[..left_start];
+                let left_expr = &left[left_start..];
+                
+                // 2. Find the middle identifier (safely skipping whitespace)
+                let mid_start = rest1.find(|c: char| !c.is_whitespace()).unwrap_or(rest1.len());
+                let rest1_trim = &rest1[mid_start..];
+                
+                let mut mid_len = 0;
+                for (j, c) in rest1_trim.char_indices() {
+                    if !c.is_alphanumeric() && c != '_' {
+                        mid_len = j;
+                        break;
+                    }
+                }
+                
+                // If we didn't find a valid identifier, continue scanning
+                if mid_len == 0 { continue; } 
+                
+                let middle = &rest1_trim[..mid_len];
+                let rest2 = &rest1_trim[mid_len..];
+                
+                // 3. Find the second operator (safely skipping whitespace)
+                let op2_start = rest2.find(|c: char| !c.is_whitespace()).unwrap_or(rest2.len());
+                let rest2_trim = &rest2[op2_start..];
+                
+                let mut found_op2 = None;
+                for op in ops {
+                    if rest2_trim.starts_with(op) {
+                        found_op2 = Some(op);
+                        break;
+                    }
+                }
+                
+                // If we found a valid A < B < C chain
+                if let Some(op2) = found_op2 {
+                    let rest3 = &rest2_trim[op2.len()..];
+                    
+                    // Isolate the right expression from any subsequent logic
+                    let mut right_end = rest3.len();
+                    for (k, c) in rest3.char_indices() {
+                        if c == '&' || c == '|' || c == ',' || c == ';' || c == '=' || c == ')' || c == ']' || c == '}' {
+                            right_end = k;
+                            break;
+                        }
+                    }
+                    let right_expr = &rest3[..right_end];
+                    let suffix = &rest3[right_end..];
+                    
+                    // 4. Reassemble with explicit grouping: prefix + (L op1 M) && (M op2 R) + suffix
+                    result = format!(
+                        "{}({} {} {}) && ({} {} {}){}",
+                        prefix,
+                        left_expr.trim(),
+                        op1,
+                        middle,
+                        middle,
+                        op2,
+                        right_expr.trim(),
+                        suffix
+                    );
+                    changed = true;
+                    break; // Break the character scan and restart the while loop with the newly expanded string
+                }
+            }
+        }
+    }
+    
+    result
+}
+
 /// Match counterexample values to function params by name.
 /// The counterexample var_name is like "x!" — strip the "!" suffix to match param names.
 fn match_counterexamples(
@@ -227,7 +339,12 @@ fn match_counterexamples(
                 let clean = c.var_name.trim_end_matches('!');
                 clean == p.name
             });
-            cex.map(|c| (p.name.clone(), p.typ_str.clone(), c.var_value.clone()))
+            cex.map(|c| {
+                // Prefer the type the querying step attached (e.g. "Vec<u32>"); fall
+                // back to the type derived from VIR for simple scalars.
+                let typ = c.var_type.clone().unwrap_or_else(|| p.typ_str.clone());
+                (p.name.clone(), typ, c.var_value.clone())
+            })
         })
         .collect()
 }
@@ -301,15 +418,20 @@ pub fn generate_test_file(
     // Fix up ensures text for exec-mode type correctness
     let ensures_exec = fixup_ensures_for_exec(&parts.ensures_text, &ret, &params);
 
+    // Expand chained inequalities for compatibility with standard Rust parsing
+    // (exec_spec_unverified! doesn't use Verus's custom parser)
+    let requires_expanded = expand_chained_inequalities(&parts.requires_text);
+    let ensures_expanded = expand_chained_inequalities(&ensures_exec);
+
     // exec_spec_unverified! block
     out.push_str("exec_spec_unverified! {\n");
     out.push_str(&format!(
         "    spec fn {}_requires({}) -> bool {{\n        {}\n    }}\n\n",
-        fn_name, params_sig, parts.requires_text
+        fn_name, params_sig, requires_expanded
     ));
     out.push_str(&format!(
         "    spec fn {}_ensures({}) -> bool {{\n        {}\n    }}\n",
-        fn_name, params_with_ret, ensures_exec
+        fn_name, params_with_ret, ensures_expanded
     ));
     out.push_str("}\n\n");
 

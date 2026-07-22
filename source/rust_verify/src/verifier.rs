@@ -972,7 +972,30 @@ impl Verifier {
                                 eprintln!("Function: {:?}", context.fun);
                                 for cex in cex_values {
                                     let clean_name = cex.var_name.trim_end_matches('!');
-                                    eprintln!("  {} = {}", clean_name, cex.var_value);
+                                    // For vectors, also show the length for a clearer pretty-print.
+                                    let is_vec = cex
+                                        .var_type
+                                        .as_ref()
+                                        .map(|t| t.starts_with("Vec<"))
+                                        .unwrap_or(false);
+                                    if is_vec {
+                                        let inner = cex
+                                            .var_value
+                                            .trim()
+                                            .trim_start_matches("vec!")
+                                            .trim()
+                                            .trim_start_matches('[')
+                                            .trim_end_matches(']')
+                                            .trim();
+                                        let len = if inner.is_empty() {
+                                            0
+                                        } else {
+                                            inner.split(',').count()
+                                        };
+                                        eprintln!("  {} (len {}) = {}", clean_name, len, cex.var_value);
+                                    } else {
+                                        eprintln!("  {} = {}", clean_name, cex.var_value);
+                                    }
                                 }
                                 eprintln!("======================\n");
                                 captured_counterexamples = counter_ex.clone();

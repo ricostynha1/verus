@@ -446,6 +446,49 @@ fn smt_get_model(
     for def in model.iter() {
         model_defs.insert(def.name.clone(), def.clone());
     }
+
+    // Gather counterexample values by querying the model (SMT `(eval ...)`) instead
+    // of reading printed constant bodies. Querying is the only way to recover the
+    // contents of composite values like `Vec`, whose elements live across the
+    // interpretations of `Seq.len`/`Seq.index`/`View.view` rather than in a single
+    // constant. Model completion is enabled so those reads resolve to concrete values.
+    // Must run before we assert any label below, which would invalidate the model.
+    // End in !
+    // intermediary values are like so x!1 (for now not using)
+    let candidates: Vec<(String, crate::ast::Typ)> = model_defs
+        .iter()
+        .filter(|(_, def)| def.params.len() == 0)
+        .filter(|(name, _)| name.ends_with('!') || name.contains('@'))
+        .filter(|(name, _)| !name.starts_with("%%"))
+        .map(|(name, def)| (name.to_string(), def.ret.clone()))
+        .collect();
+
+    // Turn on model completion for the eval queries below.
+    context.smt_log.log_set_option("model.completion", "true");
+    let opt_data = context.smt_log.take_pipe_data();
+    let _ = context.get_smt_process().send_commands(opt_data);
+
+    let mut counterexamples: Vec<Counterexample> = Vec::new();
+    for (name, ret) in candidates {
+        match &*ret {
+            // Vec: reconstruct its elements by querying its Seq view (see helper).
+            crate::ast::TypX::Named(sort) if sort.starts_with("alloc!vec.Vec<") => {
+                if let Some(cex) = query_vec_counterexample(context, &name, sort) {
+                    counterexamples.push(cex);
+                }
+            }
+            _ => {
+                // Simple scalar (Int/Bool/...): evaluate the variable directly.
+                let raw = context.eval_expr(parse_smt_term(&name));
+                counterexamples.push(Counterexample {
+                    var_name: name.clone(),
+                    var_value: clean_smt_value(&raw),
+                    var_type: None,
+                });
+            }
+        }
+    }
+
     for info in infos.iter_mut() {
         if let Some(def) = model_defs.get(&info.label) {
             if *def.body == "true" {
@@ -477,27 +520,6 @@ fn smt_get_model(
         }
     }
 
-    // Gather counterexample values they appear on models like so
-    //ModelDefX { name: "y!", params: [], ret: Int, body: "4294966061" }
-    // End in !
-    // intermediary values are like so x!1 (for now not using)
-
-    let counterexamples: Vec<Counterexample> = model_defs.iter()
-    .filter(|(_, def)| def.params.len() == 0)   // only constants (zero-arity)
-    .filter(|(name, _)| {
-        name.ends_with("!") || name.contains("@")  // params or locals
-    })
-    .filter(|(name, _)| {
-        !name.starts_with("%%")  // skip internal labels
-    })
-    .map(|(name, def)| {
-        Counterexample {var_name : name.to_string(), var_value : (*def.body).clone(), var_type : None}
-    })
-    .collect();
-
-    // Simple variable names appear on the model like so
-    //  ModelDefX { name: "x!", params: [], ret: Int, body: "4294966059" },
-    // variable!
     if context.debug {
         println!("Z3 model: {:?}", &model);
     }
@@ -513,6 +535,92 @@ fn smt_get_model(
     let e = context.message_interface.append_labels(&error, &discovered_additional_info);
     context.state = ContextState::FoundInvalid(infos, Some(air_model.clone()));
     ValidityResult::Invalid(Some(air_model), Some(e), discovered_assert_id.unwrap(), Some(counterexamples))
+}
+
+/// Parse an SMT term string into an s-expression node for `(eval ...)`.
+fn parse_smt_term(s: &str) -> sise::Node {
+    let mut parser = sise::Parser::new(s.as_bytes());
+    sise::read_into_tree(&mut parser).expect("counterexample: failed to parse SMT term")
+}
+
+/// Normalize an SMT scalar value into Rust literal text.
+/// Z3 prints negatives as `(- 5)`; turn that into `-5`. Other values pass through.
+fn clean_smt_value(s: &str) -> String {
+    let t = s.trim();
+    if let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        let inner = inner.trim();
+        if let Some(n) = inner.strip_prefix('-') {
+            return format!("-{}", n.trim());
+        }
+        return inner.to_string();
+    }
+    t.to_string()
+}
+
+/// Map an integer element-type name (as found in a Vec sort string) to its SMT
+/// type term and Rust type name. Returns None for unsupported element types.
+fn int_type_smt_and_rust(t: &str) -> Option<(String, &'static str)> {
+    let r = match t {
+        "u8" => ("(UINT 8)".to_string(), "u8"),
+        "u16" => ("(UINT 16)".to_string(), "u16"),
+        "u32" => ("(UINT 32)".to_string(), "u32"),
+        "u64" => ("(UINT 64)".to_string(), "u64"),
+        "u128" => ("(UINT 128)".to_string(), "u128"),
+        "usize" => ("USIZE".to_string(), "usize"),
+        "i8" => ("(SINT 8)".to_string(), "i8"),
+        "i16" => ("(SINT 16)".to_string(), "i16"),
+        "i32" => ("(SINT 32)".to_string(), "i32"),
+        "i64" => ("(SINT 64)".to_string(), "i64"),
+        "i128" => ("(SINT 128)".to_string(), "i128"),
+        "isize" => ("ISIZE".to_string(), "isize"),
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// Reconstruct a `Vec` counterexample by querying the model. The element type is
+/// parsed from the SMT sort string (e.g. `alloc!vec.Vec<u32./alloc!alloc.Global.>.`),
+/// then the length and each element are evaluated through the Vec's `Seq` view.
+fn query_vec_counterexample(
+    context: &mut Context,
+    name: &str,
+    sort: &str,
+) -> Option<Counterexample> {
+    // element type is the token between "Vec<" and the following "."
+    let after = sort.split_once("Vec<")?.1;
+    let elem_raw = after.split('.').next()?;
+    let (smt_elem_ty, rust_elem_ty) = int_type_smt_and_rust(elem_raw)?;
+
+    // The Seq view of the Vec, shared by the length and index queries.
+    let view = format!(
+        "(vstd!view.View.view.? $ (TYPE%alloc!vec.Vec. $ {ety} $ ALLOCATOR_GLOBAL) (Poly%{sort} {name}))",
+        ety = smt_elem_ty,
+        sort = sort,
+        name = name,
+    );
+
+    let len_term = format!("(vstd!seq.Seq.len.? $ {ety} {view})", ety = smt_elem_ty, view = view);
+    let len: i64 = clean_smt_value(&context.eval_expr(parse_smt_term(&len_term))).parse().ok()?;
+    if len < 0 {
+        return None;
+    }
+
+    let mut elems: Vec<String> = Vec::new();
+    for i in 0..len {
+        let elem_term = format!(
+            "(%I (vstd!seq.Seq.index.? $ {ety} {view} (I {i})))",
+            ety = smt_elem_ty,
+            view = view,
+            i = i,
+        );
+        elems.push(clean_smt_value(&context.eval_expr(parse_smt_term(&elem_term))));
+    }
+
+    Some(Counterexample {
+        var_name: name.to_string(),
+        var_value: format!("vec![{}]", elems.join(", ")),
+        var_type: Some(format!("Vec<{}>", rust_elem_ty)),
+    })
 }
 
 pub(crate) fn smt_check_query<'ctx>(
