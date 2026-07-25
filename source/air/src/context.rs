@@ -42,11 +42,45 @@ pub enum UsageInfo {
     UsedAxioms(Vec<Ident>),
 }
 
+/// Result of the T2 Z3-side refinement (pin the extracted model back into the
+/// failing query and re-run `check-sat`):
+/// - `Real`: pinning kept the query satisfiable (`sat`) — the concrete witness
+///   genuinely violates the property, so this is a real failing input.
+/// - `Spurious`: pinning made the query unsatisfiable (`unsat`) — the model was
+///   a solver artifact (e.g. incomplete quantifiers / disabled non-linear
+///   arithmetic) that collapses once the values are made concrete.
+/// - `Inconclusive`: the solver still returned `unknown` even after pinning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CexClassification {
+    Real,
+    Spurious,
+    Inconclusive,
+}
+
+impl std::fmt::Display for CexClassification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            CexClassification::Real => {
+                "REAL (pinned witness kept the query sat; genuine failing input)"
+            }
+            CexClassification::Spurious => {
+                "SPURIOUS (pinning the witness made the query unsat; solver artifact)"
+            }
+            CexClassification::Inconclusive => {
+                "INCONCLUSIVE (solver returned unknown even after pinning)"
+            }
+        };
+        write!(f, "{}", s)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Counterexample {
     pub var_name : String,
     pub var_value : String,
     pub var_type : Option<String>, // For now option untill be able to parse it
+    /// Set by the T2 refinement pass (same value for every variable in a model).
+    pub classification : Option<CexClassification>,
 }
 
 #[derive(Debug)]

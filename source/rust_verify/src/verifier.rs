@@ -998,6 +998,23 @@ impl Verifier {
                                     }
                                 }
                                 eprintln!("======================\n");
+
+                                // Refined counterexample (T2): the same extracted
+                                // values, re-checked by pinning the inputs back into
+                                // Z3 and re-running check-sat. The classification is
+                                // computed model-wide, so it is identical on every
+                                // variable; read it off the first one.
+                                if let Some(class) =
+                                    cex_values.first().and_then(|c| c.classification)
+                                {
+                                    eprintln!("=== Refined Counterexample (Z3-side refinement) ===");
+                                    for cex in cex_values {
+                                        let clean_name = cex.var_name.trim_end_matches('!');
+                                        eprintln!("  {} = {}", clean_name, cex.var_value);
+                                    }
+                                    eprintln!("Classification: {}", class);
+                                    eprintln!("===================================================\n");
+                                }
                                 captured_counterexamples = counter_ex.clone();
                             }
                         }
