@@ -14,6 +14,7 @@ use crate::smt_verify::ReportLongRunning;
 use crate::typecheck::Typing;
 use sise::Node;
 use std::any::Any;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +75,20 @@ impl std::fmt::Display for CexClassification {
     }
 }
 
+/// Whether a model variable corresponds to a function **input** or **output**.
+///
+/// This distinction does not exist at the SMT level (inputs and the return value
+/// are all identical `!`-suffixed declare-consts), so it is carried down from VIR
+/// (`ParPurpose`: Input = Regular + MutPre, Output = MutPost + return) via the
+/// `Context::counterexample_roles` side-table and read here during counterexample
+/// gathering. It drives (a) which Vec inputs get instantiated/materialized and
+/// (b) the later assume-inputs vs assume-inputs+outputs stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarRole {
+    Input,
+    Output,
+}
+
 #[derive(Debug, Clone)]
 pub struct Counterexample {
     pub var_name : String,
@@ -81,6 +96,8 @@ pub struct Counterexample {
     pub var_type : Option<String>, // For now option untill be able to parse it
     /// Set by the T2 refinement pass (same value for every variable in a model).
     pub classification : Option<CexClassification>,
+    /// Input vs output, resolved from `Context::counterexample_roles` (VIR ParPurpose).
+    pub role : Option<VarRole>,
 }
 
 #[derive(Debug)]
@@ -156,6 +173,10 @@ pub struct Context {
     pub(crate) usage_info_enabled: bool,
     pub(crate) check_valid_used: bool,
     pub(crate) solver: SmtSolver,
+    /// Input/output role per model variable (by lowered const name, e.g. `old_v!`),
+    /// pushed down from VIR before each `check_valid`. Empty when not verifying with
+    /// `--counterexample`. Read during counterexample gathering; see [`VarRole`].
+    pub(crate) counterexample_roles: HashMap<String, VarRole>,
 }
 
 impl Context {
@@ -223,6 +244,7 @@ impl Context {
             usage_info_enabled: false,
             check_valid_used: false,
             solver,
+            counterexample_roles: HashMap::new(),
         };
         context.axiom_infos.push_scope(false);
         context.array_map.push_scope(false);
@@ -530,6 +552,13 @@ impl Context {
 
     pub fn check_valid_used(&self) -> bool {
         self.check_valid_used
+    }
+
+    /// Install the input/output role map (by lowered const name) used by
+    /// counterexample gathering. Pushed down from VIR before a `check_valid`.
+    /// Overwritten per query; pass an empty map to clear.
+    pub fn set_counterexample_roles(&mut self, roles: HashMap<String, VarRole>) {
+        self.counterexample_roles = roles;
     }
 
     /// After receiving ValidityResult::Invalid, try to find another error.

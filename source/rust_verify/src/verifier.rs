@@ -1667,6 +1667,33 @@ impl Verifier {
                             if let Some(rlimit) = function.x.attrs.rlimit {
                                 Self::set_rlimit(&mut query_air_context, rlimit);
                             }
+                            // Push down the VIR input/output roles (ParPurpose) so
+                            // counterexample gathering can tell inputs from outputs
+                            // (indistinguishable `!` consts at the SMT level). Drives
+                            // which Vec inputs get materialized/instantiated. Only
+                            // needed under --counterexample.
+                            if self.args.counterexample {
+                                use vir::ast_util::LowerUniqueVar;
+                                let mut roles: HashMap<String, air::context::VarRole> =
+                                    HashMap::new();
+                                for par in function.x.pars.iter() {
+                                    let role = match par.x.purpose {
+                                        vir::sst::ParPurpose::MutPost => {
+                                            air::context::VarRole::Output
+                                        }
+                                        vir::sst::ParPurpose::MutPre
+                                        | vir::sst::ParPurpose::Regular => {
+                                            air::context::VarRole::Input
+                                        }
+                                    };
+                                    roles.insert(par.x.name.lower().to_string(), role);
+                                }
+                                roles.insert(
+                                    function.x.ret.x.name.lower().to_string(),
+                                    air::context::VarRole::Output,
+                                );
+                                query_air_context.set_counterexample_roles(roles);
+                            }
                             let RunCommandQueriesResult {
                                 invalidity: command_invalidity,
                                 timed_out: command_timed_out,
