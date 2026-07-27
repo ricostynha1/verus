@@ -452,12 +452,27 @@ fn smt_get_model(
     // the extraction and the pin-and-recheck live in `counterexample.rs`; see that
     // module for the mechanism. This must run before we assert any label below,
     // which would invalidate the model.
-    let (mut counterexamples, pins, param_names) =
-        crate::counterexample::gather_counterexamples(context, &model);
-    let classification =
-        crate::counterexample::refine_and_classify(context, &pins, &param_names);
+    let crate::counterexample::GatheredCounterexamples {
+        mut counterexamples,
+        input_pins,
+        output_pins,
+        instantiated,
+    } = crate::counterexample::gather_counterexamples(context, &model);
+    let mut stage_report: Vec<String> = Vec::new();
+    let classification = crate::counterexample::refine_and_classify(
+        context,
+        &input_pins,
+        &output_pins,
+        instantiated,
+        &mut stage_report,
+    );
     for cex in counterexamples.iter_mut() {
         cex.classification = Some(classification);
+    }
+    // Attach the per-stage pipeline trace to the first counterexample only (it is
+    // the same trace for the whole model); the verifier prints it.
+    if let Some(first) = counterexamples.first_mut() {
+        first.stage_report = Some(stage_report);
     }
 
     for info in infos.iter_mut() {

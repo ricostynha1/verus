@@ -58,6 +58,56 @@ pub(crate) fn clean_smt_value(s: &str) -> String {
     t.to_string()
 }
 
+/// Render a cleaned scalar model value for *display*, using the Rust type pushed
+/// down from VIR (`Context::counterexample_types`) to recover distinctions the SMT
+/// sort drops. Only the printed value is affected — the value pinned back into the
+/// solver always uses the raw SMT term (a `char` is pinned as its codepoint int).
+///
+/// - `char`: the model gives a unicode codepoint (an `Int`); render it as a Rust
+///   char literal `'A'` (with escaping) instead of `65`.
+/// - struct/tuple: the model gives a constructor application
+///   `<sort>./<Ctor> <arg0> <arg1> ...`; render it as `Ctor(arg0, arg1)` (or
+///   `(arg0, arg1)` for tuples) when every field is already concrete.
+fn render_scalar(cleaned: &str, rust_ty: Option<&str>) -> String {
+    if rust_ty == Some("char") {
+        if let Ok(cp) = cleaned.parse::<u32>() {
+            if let Some(c) = char::from_u32(cp) {
+                return format!("'{}'", c.escape_default());
+            }
+        }
+        return cleaned.to_string();
+    }
+    render_constructor(cleaned)
+}
+
+/// Prettify a datatype constructor application the model returns as
+/// `<sort>./<Ctor> <arg0> <arg1> ...` into `Ctor(arg0, arg1)` (structs/enums) or
+/// `(arg0, arg1)` (tuples). Left untouched (returned verbatim) unless every field
+/// is a simple concrete token — if any field is itself parenthesized (a negative
+/// `(- 5)` or a nested constructor) or an opaque `Poly!val!N` handle, we do not
+/// risk mangling it. This is display-only.
+fn render_constructor(cleaned: &str) -> String {
+    // Nested structure (negatives, nested ctors) — leave raw rather than mangle.
+    if cleaned.contains('(') {
+        return cleaned.to_string();
+    }
+    let tokens: Vec<&str> = cleaned.split_whitespace().collect();
+    if tokens.len() < 2 || !tokens[0].contains("./") {
+        return cleaned.to_string();
+    }
+    // Opaque, un-materialized fields (e.g. tuple's `Poly!val!N`): don't pretend.
+    if tokens[1..].iter().any(|t| t.contains("!val!")) {
+        return cleaned.to_string();
+    }
+    let ctor = tokens[0].rsplit('/').next().unwrap_or(tokens[0]);
+    let args = tokens[1..].join(", ");
+    if ctor.starts_with("tuple%") {
+        format!("({})", args)
+    } else {
+        format!("{}({})", ctor, args)
+    }
+}
+
 /// Map an integer element-type name (as found in a Vec sort string) to its SMT
 /// type term and Rust type name. Returns None for unsupported element types.
 fn int_type_smt_and_rust(t: &str) -> Option<(String, &'static str)> {
@@ -154,7 +204,7 @@ fn vec_materialization_terms(
 pub(crate) fn gather_counterexamples(
     context: &mut Context,
     model: &[ModelDef],
-) -> (Vec<Counterexample>, Vec<String>, Vec<String>) {
+) -> GatheredCounterexamples {
     let candidates: Vec<(String, Typ)> = model
         .iter()
         .filter(|def| def.params.len() == 0)
@@ -208,52 +258,60 @@ pub(crate) fn gather_counterexamples(
     }
 
     let mut counterexamples: Vec<Counterexample> = Vec::new();
-    let mut pins: Vec<String> = Vec::new();
-    let mut param_names: Vec<String> = Vec::new();
+    // Pins are split by role: refutation pins **inputs**; confirmation additionally
+    // pins **outputs**. Pinning outputs *together with* inputs is what makes the
+    // check a test of the *specific* witnessed (input, output) pair against the
+    // failing query (see `refine_and_classify`), instead of relying on the body —
+    // which is `TASKS`' "requires the concrete input / ensures the concrete output"
+    // shape. A concrete pair that is a genuine counterexample stays consistent
+    // (sat/unknown); a spurious one becomes `unsat` once fully pinned.
+    let mut input_pins: Vec<String> = Vec::new();
+    let mut output_pins: Vec<String> = Vec::new();
     for (name, ret) in candidates {
         let is_param = name.ends_with('!');
         let role = context.counterexample_roles.get(name.as_str()).copied();
-        // Refutation/confirmation pin only the **inputs'** *values* — the failing
-        // input witness. Outputs (the return value) are *derived* by the body;
-        // pinning their under-constrained materialized-model value over-constrains
-        // the re-check and mislabels genuine bugs as spurious. The output's *name*
-        // is still recorded in `param_names` because the `ens` application needs it
-        // as a (free) argument — confirmation then asks "can ens hold for ANY output
-        // given these inputs?". (Roles come from VIR; if unset, only a known Output
-        // is excluded from value-pinning.)
-        let pin_value = is_param && role != Some(VarRole::Output);
+        // Where does this variable's value-pin go? Inputs (and unknown-role params)
+        // → input_pins; the return/output → output_pins. `@` locals are never
+        // pinned (the body recomputes them).
+        let pin_bucket: Option<&mut Vec<String>> = if !is_param {
+            None
+        } else if role == Some(VarRole::Output) {
+            Some(&mut output_pins)
+        } else {
+            Some(&mut input_pins)
+        };
         match &*ret {
             // Vec: reconstruct its elements by querying its Seq view (see helper).
             TypX::Named(sort) if sort.starts_with("alloc!vec.Vec<") => {
                 if let Some((mut cex, vec_pins)) = query_vec_counterexample(context, &name, sort) {
                     cex.role = role;
                     counterexamples.push(cex);
-                    if is_param {
-                        if pin_value {
-                            pins.extend(vec_pins);
-                        }
-                        // The raw Vec constant is itself the ens argument (free if output).
-                        param_names.push(name.clone());
+                    if let Some(bucket) = pin_bucket {
+                        bucket.extend(vec_pins);
                     }
                 }
             }
             _ => {
                 // Simple scalar (Int/Bool/...): evaluate the variable directly.
                 let raw = context.eval_expr(parse_smt_term(&name));
-                if is_param {
-                    if pin_value {
-                        // The raw eval output is already valid SMT (e.g. `8`, `(- 5)`,
-                        // `true`), so it can be pinned verbatim.
-                        pins.push(format!("(= {} {})", name, raw.trim()));
-                    }
-                    param_names.push(name.clone());
+                if let Some(bucket) = pin_bucket {
+                    // The raw eval output is already valid SMT (e.g. `8`, `(- 5)`,
+                    // `true`), so it can be pinned verbatim. NOTE: pin the raw SMT
+                    // value, never the display rendering below (a `char` is pinned
+                    // as its codepoint int, not as `'A'`).
+                    bucket.push(format!("(= {} {})", name, raw.trim()));
                 }
+                // Recover the Rust type (char/struct/tuple/...) the SMT sort dropped,
+                // for display only.
+                let rust_ty = context.counterexample_types.get(name.as_str()).cloned();
+                let cleaned = clean_smt_value(&raw);
                 counterexamples.push(Counterexample {
                     var_name: name.clone(),
-                    var_value: clean_smt_value(&raw),
-                    var_type: None,
+                    var_value: render_scalar(&cleaned, rust_ty.as_deref()),
+                    var_type: rust_ty,
                     classification: None,
                     role,
+                    stage_report: None,
                 });
             }
         }
@@ -265,7 +323,19 @@ pub(crate) fn gather_counterexamples(
         let _ = context.get_smt_process().send_commands(data);
     }
 
-    (counterexamples, pins, param_names)
+    GatheredCounterexamples { counterexamples, input_pins, output_pins, instantiated: instantiation_pushed }
+}
+
+/// Result of `gather_counterexamples`: the display values plus the role-split pins
+/// the refinement stages consume.
+pub(crate) struct GatheredCounterexamples {
+    pub(crate) counterexamples: Vec<Counterexample>,
+    /// Equality pins for the **input** witness (refutation + confirmation).
+    pub(crate) input_pins: Vec<String>,
+    /// Equality pins for the **output** witness (confirmation only).
+    pub(crate) output_pins: Vec<String>,
+    /// Whether the instantiation/materialization stage actually ran (for the trace).
+    pub(crate) instantiated: bool,
 }
 
 /// Reconstruct a `Vec` counterexample by querying the model, returning both the
@@ -312,6 +382,7 @@ fn query_vec_counterexample(
         var_type: Some(format!("Vec<{}>", rust_elem_ty)),
         classification: None,
         role: None,
+        stage_report: None,
     };
     Some((cex, pins))
 }
@@ -351,83 +422,169 @@ fn check_sat_with(context: &mut Context, terms: &[String]) -> SatResult {
     SatResult::Unknown
 }
 
-/// Find the SMT `ens%...` function of the *user* function under verification
-/// (i.e. not one injected by a library crate), returning its mangled name and
-/// arity. Returns `None` if there is not exactly one such function (ambiguous or
-/// absent), in which case confirmation is skipped.
-fn find_user_ens(context: &Context) -> Option<(String, usize)> {
-    const LIBS: [&str; 6] =
-        ["vstd!", "alloc!", "core!", "std!", "builtin!", "verus_builtin!"];
-    let mut found: Option<(String, usize)> = None;
-    for (name, decl) in context.typing.decls.map().iter() {
-        let n: &str = name.as_str();
-        let Some(rest) = n.strip_prefix("ens%") else { continue };
-        if LIBS.iter().any(|l| rest.starts_with(l)) {
-            continue;
-        }
-        if let crate::typecheck::DeclaredX::Fun { params, .. } = &**decl {
-            if found.is_some() {
-                return None; // ambiguous: more than one user ens function
-            }
-            found = Some((n.to_string(), params.len()));
-        }
+impl std::fmt::Display for SatResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SatResult::Sat => "sat",
+            SatResult::Unsat => "unsat",
+            SatResult::Unknown => "unknown (incomplete quantifiers)",
+        };
+        write!(f, "{}", s)
     }
-    found
 }
 
-/// Confirmation stage: assert the user function's post-condition *holds* under
-/// the pinned witness. If that is `unsat`, the witness provably violates the
-/// post-condition, so it is a genuine failing input.
+/// The Z3-side refinement, run as the two witness-pinning stages of the pipeline.
 ///
-/// The ens function's argument order (parameters..., return) is a VIR-level
-/// convention not recoverable from the SMT declaration alone, so for the common
-/// binary-signature case we try both orderings and accept an `unsat` from
-/// either. Because only `unsat` upgrades the verdict to REAL, a wrong ordering
-/// can at worst leave the result inconclusive — it can never fabricate a REAL.
-fn confirm_real(context: &mut Context, pins: &[String], param_names: &[String]) -> bool {
-    let Some((ens, arity)) = find_user_ens(context) else { return false };
-    if param_names.is_empty() || param_names.len() != arity {
-        // Can't build a well-typed application without an exact argument match.
-        return false;
-    }
-
-    let mut orders: Vec<Vec<String>> = vec![param_names.to_vec()];
-    if arity == 2 {
-        orders.push(vec![param_names[1].clone(), param_names[0].clone()]);
-    }
-
-    for order in orders {
-        let ens_holds = format!("({} {})", ens, order.join(" "));
-        let mut terms: Vec<String> = pins.to_vec();
-        terms.push(ens_holds);
-        if check_sat_with(context, &terms) == SatResult::Unsat {
-            return true;
-        }
-    }
-    false
-}
-
-/// Two-stage Z3-side refinement. See the module docs. Returns the classification
-/// for the whole model (the caller stamps it onto every extracted variable).
+/// Both stages pin the *concrete counterexample values* back into the still-loaded
+/// failing query (which already asserts the negation of the property) and re-check:
+///
+/// - **Refute** — pin the concrete **inputs** (`requires`-side). This is the
+///   "assume inputs" step: does the failing query stay satisfiable once the inputs
+///   are nailed to the witness?
+/// - **Confirm** — additionally pin the concrete **output** (`ensures`-side). This
+///   is the "assume inputs + output" step: does the *specific* witnessed
+///   (input, output) pair stay consistent with the failing query?
+///
+/// **Polarity (important, and empirically grounded):** Verus always runs Z3 with a
+/// large quantified prelude and `smt.mbqi false`, tuned to prove `unsat`. So a
+/// *genuine* counterexample's fully-pinned re-check does **not** return `sat` — it
+/// returns `unknown ("incomplete quantifiers")` (verified: this holds even for a
+/// hand-written `assume(input); …; assert(output)` source function, and even for
+/// unbounded `int`; unlike Dafny, whose lean query returns a clean `sat`). The one
+/// answer Z3 gives cleanly is `unsat`, which happens exactly when the pinned
+/// concrete witness is **inconsistent** — i.e. it cannot actually occur, so the
+/// counterexample is a solver artifact. Hence:
+///
+/// - `unsat`  → **Spurious** (the witness cannot occur), and
+/// - `sat` / `unknown` → **Real** (the concrete witness stays consistent with a
+///   genuine property violation).
+///
+/// This is what makes bare `assert` failures classify correctly too: they have no
+/// `ensures`/output to pin, so Confirm ≡ Refute, and a real assert failure's pinned
+/// input yields `unknown` → Real.
 pub(crate) fn refine_and_classify(
     context: &mut Context,
-    pins: &[String],
-    param_names: &[String],
+    input_pins: &[String],
+    output_pins: &[String],
+    instantiated: bool,
+    report: &mut Vec<String>,
 ) -> CexClassification {
-    if pins.is_empty() {
-        return CexClassification::Inconclusive;
-    }
-    // Stage 1: refutation — pin the input witness and re-check the failing query.
-    match check_sat_with(context, pins) {
-        SatResult::Sat => CexClassification::Real,
-        SatResult::Unsat => CexClassification::Spurious,
-        SatResult::Unknown => {
-            // Stage 2: confirmation — prove the post-condition can't hold here.
-            if confirm_real(context, pins, param_names) {
-                CexClassification::Real
-            } else {
-                CexClassification::Inconclusive
-            }
+    // Helper: dump the concrete witness terms that a stage pins, so the debug
+    // trace shows *exactly which counterexample* was fed to that stage's re-check.
+    fn dump_pins(report: &mut Vec<String>, pins: &[String]) {
+        if pins.is_empty() {
+            report.push("      (none)".to_string());
+        }
+        for p in pins {
+            report.push(format!("      pin: {}", p));
         }
     }
+
+    report.push(
+        "Stage 1 — Regular counterexample: read the initial model from the failing query."
+            .to_string(),
+    );
+    report.push(format!(
+        "Stage 2 — Instantiate inputs/outputs: {}",
+        if instantiated {
+            "materialized Vec elements so the witness is concrete/coherent"
+        } else {
+            "skipped (no Vec parameters to materialize)"
+        }
+    ));
+
+    if input_pins.is_empty() {
+        report.push("Stage 3 — Refute: skipped (no input witness to pin).".to_string());
+        report.push("Stage 4 — Confirm: skipped.".to_string());
+        report.push(
+            "=> Classification: INCONCLUSIVE (no concrete input to pin, cannot refute or \
+             confirm the witness)"
+                .to_string(),
+        );
+        return CexClassification::Inconclusive;
+    }
+
+    // Stage 3 — Refute: pin the concrete INPUTS back into the failing query and
+    // re-run the verification.
+    report.push(format!(
+        "Stage 3 — Refute: re-run verification with the {} concrete INPUT value(s) pinned:",
+        input_pins.len()
+    ));
+    dump_pins(report, input_pins);
+    let refute = check_sat_with(context, input_pins);
+    report.push(format!("      check-sat = {}", refute));
+    if refute == SatResult::Unsat {
+        // unsat here = the query (which asserts the property's negation) has NO model
+        // once the inputs are fixed = the property HOLDS for these inputs = the
+        // verification PASSES = this "counterexample" cannot actually occur.
+        report.push(
+            "      => UNSAT: with these concrete inputs pinned, the verification now PASSES"
+                .to_string(),
+        );
+        report.push(
+            "         (the failing query has no model), so these values can never trigger the"
+                .to_string(),
+        );
+        report.push(
+            "         failure. This witness is NOT a real counterexample — it is a solver artifact."
+                .to_string(),
+        );
+        report.push("=> Classification: SPURIOUS".to_string());
+        return CexClassification::Spurious;
+    }
+    report.push(
+        "      => still satisfiable (sat/unknown): inputs do not by themselves refute the \
+         witness; proceeding to Confirm."
+            .to_string(),
+    );
+
+    // Stage 4 — Confirm: additionally pin the concrete OUTPUT and re-check the
+    // specific witnessed (input, output) pair.
+    let mut all_pins = input_pins.to_vec();
+    all_pins.extend_from_slice(output_pins);
+    report.push(format!(
+        "Stage 4 — Confirm: re-run with inputs + the {} concrete OUTPUT value(s) pinned:",
+        output_pins.len()
+    ));
+    dump_pins(report, &all_pins);
+    let confirm = check_sat_with(context, &all_pins);
+    report.push(format!("      check-sat = {}", confirm));
+
+    let class = match confirm {
+        // Fully-pinned witness is inconsistent -> it cannot actually occur.
+        SatResult::Unsat => {
+            report.push(
+                "      => UNSAT: the exact (input, output) pair makes the query unsatisfiable, so"
+                    .to_string(),
+            );
+            report.push(
+                "         the verification PASSES for it — the pair cannot occur. SPURIOUS."
+                    .to_string(),
+            );
+            CexClassification::Spurious
+        }
+        // Stays consistent (sat, or unknown due to the prelude quantifier wall) ->
+        // the concrete witness is a genuine counterexample.
+        SatResult::Sat | SatResult::Unknown => {
+            report.push(
+                "      => sat/unknown: the concrete (input, output) pair stays consistent with the"
+                    .to_string(),
+            );
+            report.push(
+                "         property violation (Verus never returns a clean 'sat' here — its prelude"
+                    .to_string(),
+            );
+            report.push(
+                "         runs with mbqi off, so a genuine witness surfaces as 'unknown'). REAL."
+                    .to_string(),
+            );
+            CexClassification::Real
+        }
+    };
+    report.push(format!("=> Classification: {}", match class {
+        CexClassification::Real => "REAL",
+        CexClassification::Spurious => "SPURIOUS",
+        CexClassification::Inconclusive => "INCONCLUSIVE",
+    }));
+    class
 }

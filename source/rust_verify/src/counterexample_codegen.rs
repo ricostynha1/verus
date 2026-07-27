@@ -26,8 +26,13 @@ struct ParamInfo {
     typ_str: String,
 }
 
-/// Extract a Rust type string from a VIR Typ
-fn typ_to_rust_string(typ: &Typ) -> String {
+/// Extract a Rust type string from a VIR Typ.
+///
+/// NOTE: although the compile-and-run codegen this file implements is deactivated
+/// (see `verifier.rs`, `CODEGEN_CLASSIFIER`), this helper is still used: the
+/// counterexample role/type push-down reuses it to record each variable's Rust
+/// type for the Z3-side refinement's rendering (e.g. `char` vs `Int`).
+pub fn typ_to_rust_string(typ: &Typ) -> String {
     match &**typ {
         TypX::Bool => "bool".to_string(),
         TypX::Int(range) => match range {

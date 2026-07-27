@@ -1008,9 +1008,36 @@ impl Verifier {
                                     cex_values.first().and_then(|c| c.classification)
                                 {
                                     eprintln!("=== Refined Counterexample (Z3-side refinement) ===");
-                                    for cex in cex_values {
-                                        let clean_name = cex.var_name.trim_end_matches('!');
-                                        eprintln!("  {} = {}", clean_name, cex.var_value);
+                                    // Split the witness into inputs and outputs so the
+                                    // "requires the concrete input / ensures the
+                                    // concrete output" shape of the pipeline is visible.
+                                    let role_of = |cex: &air::context::Counterexample| match cex.role
+                                    {
+                                        Some(air::context::VarRole::Output) => "output",
+                                        Some(air::context::VarRole::Input) => "input",
+                                        None => "local",
+                                    };
+                                    for want in ["input", "output", "local"] {
+                                        for cex in cex_values {
+                                            if role_of(cex) == want {
+                                                let clean_name =
+                                                    cex.var_name.trim_end_matches('!');
+                                                eprintln!(
+                                                    "  [{}] {} = {}",
+                                                    want, clean_name, cex.var_value
+                                                );
+                                            }
+                                        }
+                                    }
+                                    // Per-stage pipeline trace (Regular -> Instantiate
+                                    // -> Refute -> Confirm), attached to the first cex.
+                                    if let Some(report) =
+                                        cex_values.first().and_then(|c| c.stage_report.as_ref())
+                                    {
+                                        eprintln!("--- Pipeline stages ---");
+                                        for line in report {
+                                            eprintln!("  {}", line);
+                                        }
                                     }
                                     eprintln!("Classification: {}", class);
                                     eprintln!("===================================================\n");
@@ -1693,6 +1720,30 @@ impl Verifier {
                                     air::context::VarRole::Output,
                                 );
                                 query_air_context.set_counterexample_roles(roles);
+
+                                // Push down the VIR Rust type for each param and the
+                                // return, keyed by the same lowered const name. The
+                                // SMT sort collapses e.g. `char` and every unsigned
+                                // integer onto `Int`, so counterexample rendering
+                                // needs this to print a `char` as 'A' rather than 65.
+                                // Reuses the (retained-but-deactivated) codegen type
+                                // stringifier.
+                                let mut types: HashMap<String, String> = HashMap::new();
+                                for par in function.x.pars.iter() {
+                                    types.insert(
+                                        par.x.name.lower().to_string(),
+                                        crate::counterexample_codegen::typ_to_rust_string(
+                                            &par.x.typ,
+                                        ),
+                                    );
+                                }
+                                types.insert(
+                                    function.x.ret.x.name.lower().to_string(),
+                                    crate::counterexample_codegen::typ_to_rust_string(
+                                        &function.x.ret.x.typ,
+                                    ),
+                                );
+                                query_air_context.set_counterexample_types(types);
                             }
                             let RunCommandQueriesResult {
                                 invalidity: command_invalidity,
@@ -1716,8 +1767,22 @@ impl Verifier {
                                 &mut default_prover_failed_assert_ids,
                             );
 
-                            // Generate counterexample test file if we have counterexamples
-                            if self.args.counterexample {
+                            // Generate counterexample test file if we have counterexamples.
+                            //
+                            // DEACTIVATED (kept for reference, not removed): the
+                            // compile-and-run classifier below (generate a test .rs,
+                            // shell out to `verus --compile`, run the binary, print
+                            // `=== Counterexample Classification ===`) has been
+                            // superseded by the Z3-side refinement in
+                            // `air/src/counterexample.rs` (see the
+                            // `=== Refined Counterexample ===` block), which
+                            // classifies REAL/SPURIOUS without compiling or running
+                            // anything and works on ghost code, asserts, and types
+                            // the codegen never supported. This whole block is left
+                            // in place but gated off; flip `CODEGEN_CLASSIFIER` to
+                            // `true` only to compare against the legacy path.
+                            const CODEGEN_CLASSIFIER: bool = false;
+                            if CODEGEN_CLASSIFIER && self.args.counterexample {
                                 if let Some(ref cex_values) = command_counterexamples {
                                     if let Some(source_path) = crate::counterexample_codegen::file_path_from_span(&function.span.as_string) {
                                         match crate::counterexample_codegen::generate_test_file(

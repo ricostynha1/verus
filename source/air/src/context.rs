@@ -62,13 +62,15 @@ impl std::fmt::Display for CexClassification {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             CexClassification::Real => {
-                "REAL (pinned witness kept the query sat; genuine failing input)"
+                "REAL (concrete input+output witness stays consistent with the failing \
+                 query; genuine counterexample)"
             }
             CexClassification::Spurious => {
-                "SPURIOUS (pinning the witness made the query unsat; solver artifact)"
+                "SPURIOUS (pinning the concrete input/output made the query unsat; the \
+                 witness cannot actually occur — solver artifact)"
             }
             CexClassification::Inconclusive => {
-                "INCONCLUSIVE (solver returned unknown even after pinning)"
+                "INCONCLUSIVE (no input witness to pin)"
             }
         };
         write!(f, "{}", s)
@@ -98,6 +100,11 @@ pub struct Counterexample {
     pub classification : Option<CexClassification>,
     /// Input vs output, resolved from `Context::counterexample_roles` (VIR ParPurpose).
     pub role : Option<VarRole>,
+    /// Human-readable per-stage trace of the refinement pipeline (Regular →
+    /// Instantiate → Refute(inputs) → Confirm(inputs+outputs)). Set once, on the
+    /// first counterexample of a model (same trace for the whole model); `None` on
+    /// the rest. Printed by the verifier so every pipeline stage is visible.
+    pub stage_report : Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -177,6 +184,13 @@ pub struct Context {
     /// pushed down from VIR before each `check_valid`. Empty when not verifying with
     /// `--counterexample`. Read during counterexample gathering; see [`VarRole`].
     pub(crate) counterexample_roles: HashMap<String, VarRole>,
+    /// Rust source type per model variable (by lowered const name), pushed down from
+    /// VIR alongside the roles. The AIR/SMT layer collapses several Rust types onto
+    /// the same SMT sort (e.g. `char` and every unsigned integer are all `Int`), so
+    /// this side-table is how counterexample rendering recovers the original type to
+    /// print, e.g., a `char` codepoint as `'A'` rather than `65`. Empty unless
+    /// `--counterexample`.
+    pub(crate) counterexample_types: HashMap<String, String>,
 }
 
 impl Context {
@@ -245,6 +259,7 @@ impl Context {
             check_valid_used: false,
             solver,
             counterexample_roles: HashMap::new(),
+            counterexample_types: HashMap::new(),
         };
         context.axiom_infos.push_scope(false);
         context.array_map.push_scope(false);
@@ -559,6 +574,13 @@ impl Context {
     /// Overwritten per query; pass an empty map to clear.
     pub fn set_counterexample_roles(&mut self, roles: HashMap<String, VarRole>) {
         self.counterexample_roles = roles;
+    }
+
+    /// Install the Rust-type map (by lowered const name) used by counterexample
+    /// rendering to recover types the SMT sort collapses (e.g. `char` vs `Int`).
+    /// Pushed down from VIR before a `check_valid`; overwritten per query.
+    pub fn set_counterexample_types(&mut self, types: HashMap<String, String>) {
+        self.counterexample_types = types;
     }
 
     /// After receiving ValidityResult::Invalid, try to find another error.
