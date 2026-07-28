@@ -103,6 +103,8 @@ pub struct ArgsX {
     pub allow_inline_air: bool,
     pub debugger: bool,
     pub counterexample : bool,
+    pub counterexample_gen_test : bool,
+    pub counterexample_run : bool,
     pub profile: bool,
     pub profile_all: bool,
     pub capture_profiles: bool,
@@ -151,6 +153,8 @@ impl ArgsX {
             allow_inline_air: Default::default(),
             debugger: Default::default(),
             counterexample: Default::default(),
+            counterexample_gen_test: Default::default(),
+            counterexample_run: Default::default(),
             profile: Default::default(),
             profile_all: Default::default(),
             capture_profiles: Default::default(),
@@ -401,6 +405,8 @@ pub fn parse_args_with_imports(
 
     const OPT_EXTENDED_MULTI: &str = "V";
     const OPT_COUNTEREXAMPLE: &str = "counterexample";
+    const OPT_COUNTEREXAMPLE_GEN_TEST: &str = "counterexample-gen-test";
+    const OPT_COUNTEREXAMPLE_RUN: &str = "counterexample-run";
     const EXTENDED_IGNORE_UNEXPECTED_SMT: &str = "ignore-unexpected-smt";
     const EXTENDED_DEBUG: &str = "debug";
     const EXTENDED_NO_SOLVER_VERSION_CHECK: &str = "no-solver-version-check";
@@ -596,6 +602,19 @@ pub fn parse_args_with_imports(
         OPT_COUNTEREXAMPLE,
         "Emit counterexamples",
     );
+    opts.optflag(
+        "",
+        OPT_COUNTEREXAMPLE_GEN_TEST,
+        "With --counterexample, also write the executable-contract witness test file(s) \
+         (<stem>_counterexample_test.rs) next to the source, without compiling or running them",
+    );
+    opts.optflag(
+        "",
+        OPT_COUNTEREXAMPLE_RUN,
+        "With --counterexample, for runnable (all-exec) signatures also compile and run the \
+         executable-contract witness and let its runtime verdict override the Z3-side heuristic \
+         (REAL/SPURIOUS runtime-confirmed); ghost-only signatures keep the Z3-side verdict",
+    );
 
     let print_usage = || {
         let brief = format!("Usage: {} INPUT [options]", program);
@@ -784,6 +803,8 @@ pub fn parse_args_with_imports(
         allow_inline_air: extended.contains_key(EXTENDED_ALLOW_INLINE_AIR),
         debugger: extended.contains_key(EXTENDED_DEBUG),
         counterexample: matches.opt_present(OPT_COUNTEREXAMPLE),
+        counterexample_gen_test: matches.opt_present(OPT_COUNTEREXAMPLE_GEN_TEST),
+        counterexample_run: matches.opt_present(OPT_COUNTEREXAMPLE_RUN),
         profile: {
             if matches.opt_present(OPT_PROFILE) {
                 if matches.opt_present(OPT_PROFILE_ALL) {

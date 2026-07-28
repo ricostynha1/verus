@@ -28,10 +28,10 @@ struct ParamInfo {
 
 /// Extract a Rust type string from a VIR Typ.
 ///
-/// NOTE: although the compile-and-run codegen this file implements is deactivated
-/// (see `verifier.rs`, `CODEGEN_CLASSIFIER`), this helper is still used: the
-/// counterexample role/type push-down reuses it to record each variable's Rust
-/// type for the Z3-side refinement's rendering (e.g. `char` vs `Int`).
+/// Used by two consumers: (1) the counterexample role/type push-down records each
+/// variable's Rust type for the Z3-side refinement's rendering (e.g. `char` vs
+/// `Int`); (2) `generate_test_file` emits it as the type of the counterexample
+/// input `let` bindings in the executable-contract witness (T3).
 pub fn typ_to_rust_string(typ: &Typ) -> String {
     match &**typ {
         TypX::Bool => "bool".to_string(),
@@ -47,10 +47,19 @@ pub fn typ_to_rust_string(typ: &Typ) -> String {
         // Vec<T> is a datatype whose path ends in "Vec"; render its element type.
         TypX::Datatype(Dt::Path(path), targs, _) => {
             let is_vec = path.segments.last().map(|s| s.as_str()) == Some("Vec");
-            match (is_vec, targs.first()) {
-                (true, Some(elem)) => format!("Vec<{}>", typ_to_rust_string(elem)),
+            let is_string = path.segments.last().map(|s| s.as_str()) == Some("String");
+            match (is_vec, is_string, targs.first()) {
+                (true, _, Some(elem)) => format!("Vec<{}>", typ_to_rust_string(elem)),
+                (_, true, _) => "String".to_string(),
                 _ => "/* unsupported type */".to_string(),
             }
+        }
+        // A tuple `(A, B, ..)` — render each field type so the counterexample
+        // push-down carries per-field types (used to reconstruct/print fields).
+        TypX::Datatype(Dt::Tuple(_), targs, _) => {
+            let fields =
+                targs.iter().map(|t| typ_to_rust_string(t)).collect::<Vec<_>>().join(", ");
+            format!("({})", fields)
         }
         _ => "/* unsupported type */".to_string(),
     }
@@ -142,6 +151,18 @@ fn extract_source_parts(source: &str, fn_name: &str) -> Option<SourceParts> {
             if !rest.is_empty() {
                 ensures_text.push_str(rest);
             }
+            continue;
+        }
+        // `decreases`/`recommends`/`invariant` clauses are not part of the
+        // requires/ensures spec and must not be folded into them (e.g. a
+        // recursive fn's `decreases n` would otherwise leak into the ensures
+        // body and break the generated spec fn). Stop accumulating at them.
+        if trimmed.starts_with("decreases")
+            || trimmed.starts_with("recommends")
+            || trimmed.starts_with("invariant")
+        {
+            in_requires = false;
+            in_ensures = false;
             continue;
         }
         if trimmed == "{" || trimmed.starts_with("{") {
@@ -369,14 +390,41 @@ fn vec_elem(typ_str: &str) -> Option<&str> {
     typ_str.strip_prefix("Vec<").and_then(|s| s.strip_suffix('>')).map(|s| s.trim())
 }
 
-/// Spec-mode type for a param. Spec code cannot mention `Vec`; the Verus idiom
-/// is to write contracts over the `Seq` view (`v@`). So a `Vec<T>` exec param
-/// becomes a `Seq<T>` spec param.
+/// Types whose spec view is a `Seq` and therefore use the `@` view operator in
+/// contracts (so a param named `v` appears as `v@` and must be handled like a
+/// Vec): `Vec<T>` and `String`. Returns `true` for those.
+fn is_viewed_type(typ_str: &str) -> bool {
+    vec_elem(typ_str).is_some() || typ_str == "String"
+}
+
+/// Spec-mode type for a param. Spec code cannot mention `Vec`/`String`; the Verus
+/// idiom is to write contracts over the `Seq` view (`v@`). So a `Vec<T>` exec
+/// param becomes a `Seq<T>` spec param and a `String` becomes `Seq<char>`.
 fn spec_param_type(typ_str: &str) -> String {
     match vec_elem(typ_str) {
         Some(elem) => format!("Seq<{}>", elem),
+        None if typ_str == "String" => "Seq<char>".to_string(),
         None => typ_str.to_string(),
     }
+}
+
+/// Render a counterexample value as a Rust *expression* usable as a `let`
+/// initializer for `typ`. Most values are already valid literals; a `String`
+/// value comes back as a quoted `&str` literal and needs `.to_string()`.
+fn value_as_expr(typ_str: &str, value: &str) -> String {
+    if typ_str == "String" {
+        format!("{}.to_string()", value)
+    } else {
+        value.to_string()
+    }
+}
+
+/// Whether a Rust type is a primitive scalar (`exec_spec_unverified!` passes
+/// these by value; every composite type — tuple/struct/Vec/String — is passed by
+/// reference to the generated `exec_*` functions).
+fn is_scalar_type(t: &str) -> bool {
+    matches!(t, "bool" | "char" | "int" | "nat" | "usize" | "isize")
+        || ((t.starts_with('u') || t.starts_with('i')) && t[1..].parse::<u32>().is_ok())
 }
 
 /// Remove the Verus view operator: `name@` -> `name`, for the given names.
@@ -701,12 +749,46 @@ pub fn generate_test_file(
     let params = get_params(function);
     let ret = get_ret(function);
 
+    // The executable-contract witness validates by evaluating `ensures` on the
+    // real body's output. Functions with no return binder / unit return (their
+    // failure is a bare `assert`, e.g. ex6/ex11 — the return name is an internal
+    // `%`-mangled placeholder) have no output-vs-ensures contract to check, so
+    // skip them. They stay covered by the Z3-side classifier only.
+    if ret.name.contains('%') || ret.typ_str == "()" {
+        return Err(format!(
+            "{}: assert-failure / unit-return function has no ensures contract to \
+             validate at runtime (Z3-side classifier only)",
+            fn_name
+        ));
+    }
+
     let parts = extract_source_parts(&source, &fn_name)
         .ok_or_else(|| format!("could not find fn {} in source", fn_name))?;
+
+    // No `ensures` clause (e.g. an assert-only proof) → nothing to validate.
+    if parts.ensures_text.trim().is_empty() {
+        return Err(format!(
+            "{}: no ensures clause to validate at runtime (Z3-side classifier only)",
+            fn_name
+        ));
+    }
 
     let matched = match_counterexamples(&params, counterexamples);
     if matched.is_empty() {
         return Err("no counterexample values matched function params".to_string());
+    }
+
+    // Bail cleanly on types the codegen cannot render as a valid Rust literal
+    // yet (e.g. a user `struct`, whose value would need braced-field rendering
+    // `Point { x: .., y: .. }` and an emitted struct definition). Emitting a
+    // `/* unsupported type */` placeholder would produce a non-compiling file.
+    if let Some((name, typ, _)) =
+        matched.iter().find(|(_, typ, _)| typ.contains("unsupported"))
+    {
+        return Err(format!(
+            "{}: param `{}` has unsupported type for witness codegen ({})",
+            fn_name, name, typ
+        ));
     }
 
     // Exec-mode signature (function under test): keeps the real types (Vec<T>).
@@ -729,20 +811,21 @@ pub fn generate_test_file(
         v.join(", ")
     };
 
-    // Names of Vec-typed params/ret — these need view (`@`)/reference handling.
+    // Names of viewed (Vec/String) params/ret — these need view (`@`)/reference
+    // handling (their spec type is a `Seq`).
     let vec_names: Vec<String> = params
         .iter()
         .chain(std::iter::once(&ret))
-        .filter(|p| vec_elem(&p.typ_str).is_some())
+        .filter(|p| is_viewed_type(&p.typ_str))
         .map(|p| p.name.clone())
         .collect();
 
-    // Args passed to `_ensures` from the external_body fn: Vec args as views.
+    // Args passed to `_ensures` from the external_body fn: viewed args as `@`.
     let ensures_view_args: String = params
         .iter()
         .chain(std::iter::once(&ret))
         .map(|p| {
-            if vec_elem(&p.typ_str).is_some() {
+            if is_viewed_type(&p.typ_str) {
                 format!("{}@", p.name)
             } else {
                 p.name.clone()
@@ -819,20 +902,38 @@ pub fn generate_test_file(
     // Main function with counterexample test
     out.push_str("fn main() {\n");
 
-    // Declare counterexample values
+    // Declare counterexample values (String literals get `.to_string()`).
     for (name, typ, value) in &matched {
-        out.push_str(&format!("    let {}: {} = {};\n", name, typ, value));
+        out.push_str(&format!("    let {}: {} = {};\n", name, typ, value_as_expr(typ, value)));
+    }
+    // A `String` param's spec view is `Seq<char>`, which `exec_spec_unverified!`
+    // lowers to `&[char]`. `&String` does NOT coerce to `&[char]` (String derefs
+    // to `&str`), so build an explicit `Vec<char>` view to borrow from.
+    for p in params.iter().chain(std::iter::once(&ret)) {
+        if p.typ_str == "String" {
+            out.push_str(&format!(
+                "    let {n}_chars: Vec<char> = {n}.chars().collect();\n",
+                n = p.name
+            ));
+        }
     }
     out.push_str("\n");
 
-    // Call-site argument lists. Exec spec fns take the Seq view by reference
-    // (`&v` for a Vec), while the function under test consumes the owned Vec, so
-    // it gets a clone to keep the value available for the ensures check.
+    // Call-site argument lists.
+    //  - Exec spec fns (`by_ref = true`): scalars go by value; every composite
+    //    goes by reference. A `Vec<T>` passes as `&v` (coerces to `&[T]`); a
+    //    `String` passes its char view `&v_chars`.
+    //  - The function under test (`by_ref = false`): consumes owned args, so
+    //    non-`Copy` collections (Vec/String) are `.clone()`d to stay available
+    //    for the ensures check; scalars/tuples pass by value.
     let arg = |p: &ParamInfo, by_ref: bool| -> String {
-        match (vec_elem(&p.typ_str).is_some(), by_ref) {
-            (true, true) => format!("&{}", p.name),
-            (true, false) => format!("{}.clone()", p.name),
-            (false, _) => p.name.clone(),
+        let scalar = is_scalar_type(&p.typ_str);
+        match (scalar, by_ref) {
+            (true, _) => p.name.clone(),
+            (false, true) if p.typ_str == "String" => format!("&{}_chars", p.name),
+            (false, true) => format!("&{}", p.name),
+            (false, false) if is_viewed_type(&p.typ_str) => format!("{}.clone()", p.name),
+            (false, false) => p.name.clone(),
         }
     };
     let requires_args: String =
@@ -846,11 +947,32 @@ pub fn generate_test_file(
         .collect::<Vec<_>>()
         .join(", ");
 
-    out.push_str("    let run_result = std::panic::catch_unwind(|| {\n");
+    // Judge in two guarded phases so that a *panic* is classified correctly
+    // instead of being blanket-labeled SPURIOUS (the T5B false-negative fix):
+    //
+    //  Phase 1 — evaluate `requires` alone. If it does not hold (or panics),
+    //    the Z3 model picked an input outside the precondition, so the witness
+    //    could never legitimately occur -> SPURIOUS.
+    //
+    //  Phase 2 — with preconditions established, run the *real body* under
+    //    catch_unwind. Verus's proof obligations include no-overflow / no
+    //    out-of-bounds / no-div-by-zero, so ANY panic on a valid input is a
+    //    genuine violation of a checked obligation -> REAL BUG (this is exactly
+    //    the arithmetic-underflow case that used to be downgraded to SPURIOUS).
+    //    If the body runs to completion, judge by the ensures clause.
     out.push_str(&format!(
-        "        let preconds_hold = exec_{}_requires({});\n",
+        "    let preconds_hold = std::panic::catch_unwind(|| exec_{}_requires({}))\n",
         fn_name, requires_args
     ));
+    out.push_str("        .unwrap_or(false);\n");
+    out.push_str("    if !preconds_hold {\n");
+    out.push_str(
+        "        eprintln!(\"SPURIOUS: Z3 values violate preconditions\");\n",
+    );
+    out.push_str("        std::process::exit(0);\n");
+    out.push_str("    }\n\n");
+
+    out.push_str("    let run_result = std::panic::catch_unwind(|| {\n");
     out.push_str(&format!(
         "        let {} = {}({});\n",
         ret.name, fn_name, call_args
@@ -860,7 +982,7 @@ pub fn generate_test_file(
         fn_name, ensures_args
     ));
     out.push_str(&format!(
-        "        (preconds_hold, {}, ensures_holds)\n",
+        "        ({}, ensures_holds)\n",
         ret.name
     ));
     out.push_str("    });\n\n");
@@ -868,19 +990,16 @@ pub fn generate_test_file(
     // Match block (fixed template)
     out.push_str("    match run_result {\n");
     out.push_str("        Err(_) => {\n");
-    out.push_str("            eprintln!(\"SPURIOUS: panicked (overflow or invalid input)\");\n");
-    out.push_str("            std::process::exit(0);\n");
+    out.push_str(
+        "            eprintln!(\"REAL BUG: panicked on valid input (overflow/underflow/index -- a checked obligation Verus proves absent)\");\n",
+    );
+    out.push_str("            std::process::exit(1);\n");
     out.push_str("        }\n");
     out.push_str(&format!(
-        "        Ok((preconds_hold, {}, ensures_holds)) => {{\n",
+        "        Ok(({}, ensures_holds)) => {{\n",
         ret.name
     ));
-    out.push_str("            if !preconds_hold {\n");
-    out.push_str(
-        "                eprintln!(\"SPURIOUS: Z3 values violate preconditions\");\n",
-    );
-    out.push_str("                std::process::exit(0);\n");
-    out.push_str("            } else if !ensures_holds {\n");
+    out.push_str("            if !ensures_holds {\n");
     out.push_str("                eprintln!(\"REAL BUG: ensures violated\");\n");
     out.push_str("                std::process::exit(1);\n");
     out.push_str("            } else {\n");
@@ -891,6 +1010,115 @@ pub fn generate_test_file(
     out.push_str("            }\n");
     out.push_str("        }\n");
     out.push_str("    }\n");
+    out.push_str("}\n");
+
+    Ok((output_path, out))
+}
+
+/// Generate the **T3.5 debug reproduction test** (`<stem>_debug_test.rs`).
+///
+/// This is deliberately *not* a validator: it calls the function under test on
+/// the concrete counterexample inputs and (for a scalar output) asserts it equals
+/// the counterexample output, so a developer can step through the failing call in
+/// a debugger. Because the counterexample `(X -> Y)` was derived from the real
+/// body, running `f(X)` reproduces `Y` for BOTH real and spurious counterexamples
+/// — the assertion says nothing about real-vs-spurious (that is T3's job).
+///
+/// It is compiled/run with `verus --compile` (the body may use `vstd`, e.g.
+/// `Vec::push`); the emitted file keeps the real body but drops the `requires`/
+/// `ensures` contract so nothing is verified — it is a plain runnable binary.
+pub fn generate_debug_test_file(
+    function: &FunctionSst,
+    counterexamples: &[Counterexample],
+    source_path: &Path,
+) -> Result<(PathBuf, String), String> {
+    let source =
+        std::fs::read_to_string(source_path).map_err(|e| format!("read source: {:?}", e))?;
+
+    let fn_name = get_fn_name(function);
+    let params = get_params(function);
+    let ret = get_ret(function);
+
+    // Ghost-only signatures (proof fns) have no exec params / body to run.
+    if params.is_empty() {
+        return Err(format!("{}: no exec parameters (ghost-only), nothing to reproduce", fn_name));
+    }
+
+    let parts = extract_source_parts(&source, &fn_name)
+        .ok_or_else(|| format!("could not find fn {} in source", fn_name))?;
+
+    let matched = match_counterexamples(&params, counterexamples);
+    if matched.is_empty() {
+        return Err("no counterexample values matched function params".to_string());
+    }
+    if let Some((name, typ, _)) =
+        matched.iter().find(|(_, typ, _)| typ.contains("unsupported"))
+    {
+        return Err(format!(
+            "{}: param `{}` has unsupported type for debug codegen ({})",
+            fn_name, name, typ
+        ));
+    }
+
+    // The concrete counterexample output value (return binder, e.g. `r!`).
+    let out_value = counterexamples
+        .iter()
+        .find(|c| c.var_name.trim_end_matches('!') == ret.name)
+        .map(|c| c.var_value.clone());
+
+    let params_sig: String = params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, p.typ_str))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
+    let output_path = source_path.with_file_name(format!("{}_debug_test.rs", stem));
+
+    let mut out = String::new();
+    out.push_str(
+        "// AUTO-GENERATED debug reproduction test (T3.5) — NOT a real/spurious verdict.\n\
+         // Runs the function under test on the counterexample inputs so you can step\n\
+         // through the failing call in a debugger. The counterexample output is\n\
+         // reproduced by construction, so a passing assert here says NOTHING about\n\
+         // whether the counterexample is real or spurious (that is the T3 witness's job).\n\
+         // Build/run:  verus --compile <this file>  (then run the produced binary).\n\n",
+    );
+    out.push_str("use vstd::prelude::*;\n\n");
+    out.push_str("verus! {\n\n");
+    // Real body, contract dropped (external_body so the body is kept verbatim and
+    // nothing is verified).
+    out.push_str(&format!(
+        "#[verifier::external_body]\nfn {}({}) -> (r_out: {})\n{{\n{}\n}}\n\n",
+        fn_name, params_sig, ret.typ_str, parts.body_text,
+    ));
+    out.push_str("} // verus\n\n");
+
+    out.push_str("fn main() {\n");
+    for (name, typ, value) in &matched {
+        out.push_str(&format!("    let {}: {} = {};\n", name, typ, value_as_expr(typ, value)));
+    }
+    let call_args: String = params.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", ");
+    out.push_str(&format!("    let result = {}({});\n", fn_name, call_args));
+    out.push_str("    println!(\"result = {:?}\", result);\n");
+    // Assert equality for scalar outputs only; composite outputs (Vec/Seq/tuple/
+    // String) are printed but not asserted here (element-wise assert is left as a
+    // TODO comment to keep this file dependency-light).
+    match &out_value {
+        Some(v) if !ret.typ_str.starts_with("Vec<") && ret.typ_str != "String" => {
+            out.push_str(&format!(
+                "    assert_eq!(result, {}); // counterexample output (debug reproduction only)\n",
+                value_as_expr(&ret.typ_str, v),
+            ));
+        }
+        Some(v) => {
+            out.push_str(&format!(
+                "    // counterexample output was: {} (assert element-wise if desired)\n",
+                v,
+            ));
+        }
+        None => {}
+    }
     out.push_str("}\n");
 
     Ok((output_path, out))

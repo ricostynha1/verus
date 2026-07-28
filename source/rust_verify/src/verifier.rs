@@ -1767,22 +1767,35 @@ impl Verifier {
                                 &mut default_prover_failed_assert_ids,
                             );
 
-                            // Generate counterexample test file if we have counterexamples.
+                            // T3: executable-contract witness generation.
                             //
-                            // DEACTIVATED (kept for reference, not removed): the
-                            // compile-and-run classifier below (generate a test .rs,
-                            // shell out to `verus --compile`, run the binary, print
-                            // `=== Counterexample Classification ===`) has been
-                            // superseded by the Z3-side refinement in
-                            // `air/src/counterexample.rs` (see the
-                            // `=== Refined Counterexample ===` block), which
-                            // classifies REAL/SPURIOUS without compiling or running
-                            // anything and works on ghost code, asserts, and types
-                            // the codegen never supported. This whole block is left
-                            // in place but gated off; flip `CODEGEN_CLASSIFIER` to
-                            // `true` only to compare against the legacy path.
-                            const CODEGEN_CLASSIFIER: bool = false;
-                            if CODEGEN_CLASSIFIER && self.args.counterexample {
+                            // The always-on classifier is the Z3-side refinement in
+                            // `air/src/counterexample.rs` (the `=== Refined
+                            // Counterexample ===` block above), which classifies
+                            // REAL/SPURIOUS without compiling or running anything.
+                            //
+                            // When `--counterexample-gen-test` is passed, ALSO write
+                            // the executable-contract witness (`<stem>_counterexample_
+                            // test.rs`) and the T3.5 debug reproduction test
+                            // (`<stem>_debug_test.rs`) next to the source. These are
+                            // NOT compiled or run here — they are the runnable
+                            // ground-truth artifacts, compiled/run by hand or in CI
+                            // (`verus --compile <file>`) to confirm the Z3-side verdict.
+                            //
+                            // When `--counterexample-run` is passed (T5 part A), the
+                            // witness is ALSO compiled and executed, and its runtime
+                            // verdict OVERRIDES the Z3-side heuristic for runnable
+                            // (all-exec) signatures: `REAL BUG` -> REAL (runtime-
+                            // confirmed), `SPURIOUS` -> SPURIOUS (runtime-confirmed).
+                            // This is what resolves the ex22-style disagreement where
+                            // the `unknown`-keyed Z3-side heuristic says REAL but the
+                            // code is actually correct (missing only a proof hint):
+                            // execution is ground truth. Ghost-only signatures (no
+                            // runnable body) can't be executed, so they keep the
+                            // Z3-side verdict untouched.
+                            let want_gen = self.args.counterexample_gen_test;
+                            let want_run = self.args.counterexample_run;
+                            if self.args.counterexample && (want_gen || want_run) {
                                 if let Some(ref cex_values) = command_counterexamples {
                                     if let Some(source_path) = crate::counterexample_codegen::file_path_from_span(&function.span.as_string) {
                                         match crate::counterexample_codegen::generate_test_file(
@@ -1794,56 +1807,91 @@ impl Verifier {
                                                 if let Err(e) = std::fs::write(&out_path, &content) {
                                                     eprintln!("counterexample codegen: write error: {:?}", e);
                                                 } else {
-                                                    eprintln!("counterexample test generated: {:?}", out_path);
-                                                    // Compile and run the generated test
-                                                    if let Ok(verus_exe) = std::env::current_exe() {
-                                                        let compile_result = std::process::Command::new(&verus_exe)
-                                                            .arg("--compile")
-                                                            .arg(&out_path)
-                                                            .output();
-                                                        match compile_result {
-                                                            Ok(output) if output.status.success() => {
-                                                                // rustc puts binary in CWD with file stem as name
-                                                                let bin_name = out_path.file_stem().unwrap_or_default();
-                                                                let bin_path = std::env::current_dir()
-                                                                    .unwrap_or_default()
-                                                                    .join(bin_name);
-                                                                let run_result = std::process::Command::new(&bin_path)
-                                                                    .output();
-                                                                match run_result {
-                                                                    Ok(run_out) => {
-                                                                        let stderr = String::from_utf8_lossy(&run_out.stderr);
-                                                                        let stdout = String::from_utf8_lossy(&run_out.stdout);
-                                                                        if !stderr.is_empty() {
-                                                                            eprintln!("\n=== Counterexample Classification ===");
-                                                                            eprintln!("{}", stderr.trim());
-                                                                            eprintln!("=====================================");
-                                                                        } else if !stdout.is_empty() {
-                                                                            eprintln!("\n=== Counterexample Classification ===");
-                                                                            eprintln!("{}", stdout.trim());
-                                                                            eprintln!("=====================================");
+                                                    eprintln!("counterexample witness test generated: {:?}", out_path);
+                                                    if want_run {
+                                                        // T5(A): compile + run the witness and let its
+                                                        // runtime verdict override the Z3-side heuristic.
+                                                        if let Ok(verus_exe) = std::env::current_exe() {
+                                                            let compile_result = std::process::Command::new(&verus_exe)
+                                                                .arg("--compile")
+                                                                .arg(&out_path)
+                                                                .output();
+                                                            match compile_result {
+                                                                Ok(output) if output.status.success() => {
+                                                                    let bin_name = out_path.file_stem().unwrap_or_default();
+                                                                    let bin_path = std::env::current_dir()
+                                                                        .unwrap_or_default()
+                                                                        .join(bin_name);
+                                                                    match std::process::Command::new(&bin_path).output() {
+                                                                        Ok(run_out) => {
+                                                                            let combined = format!(
+                                                                                "{}{}",
+                                                                                String::from_utf8_lossy(&run_out.stdout),
+                                                                                String::from_utf8_lossy(&run_out.stderr),
+                                                                            );
+                                                                            let verdict = if combined.contains("REAL BUG") {
+                                                                                "REAL (runtime-confirmed)"
+                                                                            } else if combined.contains("SPURIOUS") {
+                                                                                "SPURIOUS (runtime-confirmed)"
+                                                                            } else {
+                                                                                "INCONCLUSIVE (witness output unrecognized)"
+                                                                            };
+                                                                            eprintln!("\n=== Runtime Confirmation (executable-contract witness) ===");
+                                                                            eprintln!("{}", combined.trim());
+                                                                            eprintln!("=> Runtime verdict (overrides Z3-side heuristic): {}", verdict);
+                                                                            eprintln!("==========================================================");
+                                                                            let _ = std::fs::remove_file(&bin_path);
                                                                         }
-                                                                        // Clean up binary
-                                                                        let _ = std::fs::remove_file(&bin_path);
-                                                                    }
-                                                                    Err(e) => {
-                                                                        eprintln!("counterexample run error: {:?}", e);
+                                                                        Err(e) => {
+                                                                            eprintln!("counterexample run error: {:?}", e);
+                                                                        }
                                                                     }
                                                                 }
+                                                                Ok(output) => {
+                                                                    eprintln!(
+                                                                        "counterexample witness compile failed (Z3-side verdict stands):\n{}",
+                                                                        String::from_utf8_lossy(&output.stderr),
+                                                                    );
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("counterexample compile error: {:?}", e);
+                                                                }
                                                             }
-                                                            Ok(output) => {
-                                                                let stderr = String::from_utf8_lossy(&output.stderr);
-                                                                eprintln!("counterexample compile failed:\n{}", stderr);
-                                                            }
-                                                            Err(e) => {
-                                                                eprintln!("counterexample compile error: {:?}", e);
-                                                            }
+                                                        }
+                                                        // Clean up the witness file unless the user
+                                                        // also asked to keep it via --counterexample-gen-test.
+                                                        if !want_gen {
+                                                            let _ = std::fs::remove_file(&out_path);
                                                         }
                                                     }
                                                 }
                                             }
                                             Err(e) => {
-                                                eprintln!("counterexample codegen error: {}", e);
+                                                // Non-runnable (ghost-only / unsupported): no runtime
+                                                // ground truth, so the Z3-side heuristic verdict stands.
+                                                eprintln!("counterexample codegen skipped: {}", e);
+                                                if want_run {
+                                                    eprintln!("=> Not runnable; Z3-side verdict stands (heuristic, no runtime confirmation possible).");
+                                                }
+                                            }
+                                        }
+                                        // T3.5 debug reproduction test (only when writing files).
+                                        if want_gen {
+                                            match crate::counterexample_codegen::generate_debug_test_file(
+                                                function,
+                                                cex_values,
+                                                &source_path,
+                                            ) {
+                                                Ok((dbg_path, dbg_content)) => {
+                                                    if let Err(e) = std::fs::write(&dbg_path, &dbg_content) {
+                                                        eprintln!("counterexample debug codegen: write error: {:?}", e);
+                                                    } else {
+                                                        eprintln!("counterexample debug test generated: {:?}", dbg_path);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("counterexample debug codegen skipped: {}", e);
+                                                }
                                             }
                                         }
                                     }

@@ -457,6 +457,7 @@ fn smt_get_model(
         input_pins,
         output_pins,
         instantiated,
+        changed_by_instantiation,
     } = crate::counterexample::gather_counterexamples(context, &model);
     let mut stage_report: Vec<String> = Vec::new();
     let classification = crate::counterexample::refine_and_classify(
@@ -464,6 +465,7 @@ fn smt_get_model(
         &input_pins,
         &output_pins,
         instantiated,
+        changed_by_instantiation,
         &mut stage_report,
     );
     for cex in counterexamples.iter_mut() {

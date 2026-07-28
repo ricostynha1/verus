@@ -129,28 +129,84 @@ fn int_type_smt_and_rust(t: &str) -> Option<(String, &'static str)> {
     Some(r)
 }
 
-/// Build the shared Seq-view SMT term and element SMT/Rust types for a `Vec`
-/// const, or `None` if the element type is not a supported integer type. The
-/// element type is parsed from the SMT sort string
-/// (e.g. `alloc!vec.Vec<u32./alloc!alloc.Global.>.`).
-fn vec_view_and_elem_ty(name: &str, sort: &str) -> Option<(String, &'static str, String)> {
-    let after = sort.split_once("Vec<")?.1;
-    let elem_raw = after.split('.').next()?;
-    let (smt_elem_ty, rust_elem_ty) = int_type_smt_and_rust(elem_raw)?;
-    // The allocator Type argument MUST be `TYPE%alloc!alloc.Global.` — the same
-    // term the function's requires/quantifiers use — NOT the prelude constant
-    // `ALLOCATOR_GLOBAL` (an uninterpreted `(declare-const ALLOCATOR_GLOBAL Type)`
-    // that is not equated to it in a pruned query). If they differ, the `Seq.index`
-    // ground terms we materialize land on a *different* Seq than the one
-    // `upper_bound`/`sorted` constrain, so the quantifiers never bite and the model
-    // stays bogus. (Vec's default allocator is Global.)
-    let view = format!(
-        "(vstd!view.View.view.? $ (TYPE%alloc!vec.Vec. $ {ety} $ TYPE%alloc!alloc.Global.) (Poly%{sort} {name}))",
-        ety = smt_elem_ty,
-        sort = sort,
-        name = name,
-    );
-    Some((smt_elem_ty, rust_elem_ty, view))
+/// Superset of `int_type_smt_and_rust` that also covers the *element* types that
+/// only ever appear inside composite/ghost collections — a `char` element (SMT
+/// type `CHAR`) inside a `String`/`Vec<char>`, and the unbounded ghost integer
+/// element types `int`/`nat` (SMT types `INT`/`NAT`) inside a ghost `Seq`. Kept
+/// separate so the Vec-element boundary (`int_type_smt_and_rust`, which must stay
+/// exec-representable) is not widened. Returns `(smt_type_term, rust_type_name)`.
+fn elem_smt_and_rust(t: &str) -> Option<(String, &'static str)> {
+    match t {
+        "int" => Some(("INT".to_string(), "int")),
+        "nat" => Some(("NAT".to_string(), "nat")),
+        "char" => Some(("CHAR".to_string(), "char")),
+        _ => int_type_smt_and_rust(t),
+    }
+}
+
+/// Which flavor of indexable collection a witness constant is, controlling only
+/// how the reconstructed element list is *rendered* (the SMT element-walk is the
+/// same for all three — see `collection_view` / `query_collection_counterexample`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionKind {
+    /// `Vec<T>` — rendered `vec![..]`.
+    Vec,
+    /// `String` — a `Seq<char>` view, rendered as a quoted string literal.
+    StringChars,
+    /// A bare ghost `Seq<T>` — rendered `[..]`.
+    Seq,
+}
+
+/// For a witness constant `name` of SMT sort `sort`, if it is one of the three
+/// supported indexable collections, return everything the element-walk needs:
+/// the element SMT type term, the element Rust type name, the `Seq`-view `Poly`
+/// term to index into, and the collection kind. Returns `None` for anything else
+/// (scalars, tuples, structs — handled elsewhere).
+///
+/// The three shapes differ only in how the `Seq` view is obtained:
+/// - **Vec** (`alloc!vec.Vec<T./..>.`): `View::view` of the boxed Vec, with the
+///   Type argument `(TYPE%alloc!vec.Vec. $ elemT $ TYPE%alloc!alloc.Global.)`.
+/// - **String** (`alloc!string.String.`): `View::view` of the boxed String, whose
+///   `View::V` is `Seq<char>`; the element type is always `CHAR`.
+/// - **ghost Seq** (`vstd!seq.Seq<T.>.`): already a view — just box it with
+///   `Poly%<sort>`; no `View::view` wrapper.
+fn collection_view(
+    name: &str,
+    sort: &str,
+) -> Option<(String, &'static str, String, CollectionKind)> {
+    if sort.starts_with("alloc!vec.Vec<") {
+        let after = sort.split_once("Vec<")?.1;
+        let elem_raw = after.split('.').next()?;
+        let (smt_elem_ty, rust_elem_ty) = elem_smt_and_rust(elem_raw)?;
+        // The allocator Type argument MUST be `TYPE%alloc!alloc.Global.` (see the
+        // long note that used to live in `vec_view_and_elem_ty`): using the opaque
+        // `ALLOCATOR_GLOBAL` const lands the ground `Seq.index` terms on a different
+        // Seq than the quantifiers constrain.
+        let view = format!(
+            "(vstd!view.View.view.? $ (TYPE%alloc!vec.Vec. $ {ety} $ TYPE%alloc!alloc.Global.) (Poly%{sort} {name}))",
+            ety = smt_elem_ty,
+            sort = sort,
+            name = name,
+        );
+        Some((smt_elem_ty, rust_elem_ty, view, CollectionKind::Vec))
+    } else if sort.starts_with("alloc!string.String") {
+        // A String's `View::V` is `Seq<char>`; walk it exactly like a Vec<char>.
+        let view = format!(
+            "(vstd!view.View.view.? $ TYPE%alloc!string.String. (Poly%alloc!string.String. {name}))",
+            name = name,
+        );
+        Some(("CHAR".to_string(), "char", view, CollectionKind::StringChars))
+    } else if sort.starts_with("vstd!seq.Seq<") {
+        // A bare ghost `Seq<T>` is already a view — no `View::view` wrapper, just
+        // box the concrete-sort constant back to `Poly` for `Seq.len`/`Seq.index`.
+        let after = sort.split_once("Seq<")?.1;
+        let elem_raw = after.split('.').next()?;
+        let (smt_elem_ty, rust_elem_ty) = elem_smt_and_rust(elem_raw)?;
+        let view = format!("(Poly%{sort} {name})", sort = sort, name = name);
+        Some((smt_elem_ty, rust_elem_ty, view, CollectionKind::Seq))
+    } else {
+        None
+    }
 }
 
 /// SMT assert terms that **instantiate** (materialize) an *input* `Vec` so Z3
@@ -169,7 +225,7 @@ fn vec_materialization_terms(
     name: &str,
     sort: &str,
 ) -> Option<Vec<String>> {
-    let (smt_elem_ty, _rust, view) = vec_view_and_elem_ty(name, sort)?;
+    let (smt_elem_ty, _rust, view, _kind) = collection_view(name, sort)?;
     let len_term = format!("(vstd!seq.Seq.len.? $ {ety} {view})", ety = smt_elem_ty, view = view);
     let len_raw = context.eval_expr(parse_smt_term(&len_term));
     let len: i64 = clean_smt_value(&len_raw).parse().ok()?;
@@ -187,6 +243,30 @@ fn vec_materialization_terms(
         ));
     }
     Some(terms)
+}
+
+/// Reconstruct just the *display value* of one witness constant from the current
+/// model (no pins), dispatching the same way `gather_counterexamples` does:
+/// collection → `query_collection`, tuple → `query_tuple`, else scalar. Used to
+/// snapshot the initial ("first counterexample") witness before instantiation so
+/// it can be compared against the post-instantiation witness.
+fn display_value_of(context: &mut Context, name: &str, ret: &Typ, rust_ty: Option<&str>) -> String {
+    match &**ret {
+        TypX::Named(sort) if collection_view(name, sort).is_some() => {
+            query_collection_counterexample(context, name, sort)
+                .map(|(c, _)| c.var_value)
+                .unwrap_or_default()
+        }
+        TypX::Named(sort) if sort.starts_with("tuple%") => {
+            query_tuple_counterexample(context, name, rust_ty)
+                .map(|(c, _)| c.var_value)
+                .unwrap_or_default()
+        }
+        _ => {
+            let raw = context.eval_expr(parse_smt_term(name));
+            render_scalar(&clean_smt_value(&raw), rust_ty)
+        }
+    }
 }
 
 /// Extract counterexample values from the model, plus:
@@ -247,7 +327,27 @@ pub(crate) fn gather_counterexamples(
         }
     }
     let instantiation_pushed = !materialize_terms.is_empty();
+
+    // Before materializing, snapshot the *whole* input/output witness (every `!`
+    // param and the return binder — scalars, collections and tuples alike) as
+    // reconstructed from the *initial* (un-instantiated) model — the "first
+    // counterexample". After instantiation we compare against it: if ANY value
+    // changed, the first model was an under-constrained/incoherent (likely
+    // spurious) witness that the instantiation step corrected. Crucially this
+    // includes the OUTPUT: materializing the input+output Vecs fires the body's
+    // ensures-quantifiers, which can also change a scalar/derived output value —
+    // not just the collections themselves. These are exactly the cases where this
+    // pipeline's materialization was load-bearing rather than cosmetic.
+    let mut pre_values: Vec<(String, String)> = Vec::new();
     if instantiation_pushed {
+        for def in model.iter() {
+            if def.params.len() != 0 || !def.name.ends_with('!') || def.name.starts_with("%%") {
+                continue;
+            }
+            let rust_ty = context.counterexample_types.get(def.name.as_str()).cloned();
+            let val = display_value_of(context, &def.name, &def.ret, rust_ty.as_deref());
+            pre_values.push((def.name.to_string(), val));
+        }
         context.smt_log.log_push();
         for t in &materialize_terms {
             context.smt_log.log_node(&parse_smt_term(&format!("(assert {})", t)));
@@ -281,13 +381,30 @@ pub(crate) fn gather_counterexamples(
             Some(&mut input_pins)
         };
         match &*ret {
-            // Vec: reconstruct its elements by querying its Seq view (see helper).
-            TypX::Named(sort) if sort.starts_with("alloc!vec.Vec<") => {
-                if let Some((mut cex, vec_pins)) = query_vec_counterexample(context, &name, sort) {
+            // Vec / String / ghost Seq: reconstruct their elements by querying the
+            // shared Seq view (length + per-element), see `query_collection_...`.
+            TypX::Named(sort) if collection_view(&name, sort).is_some() => {
+                if let Some((mut cex, coll_pins)) =
+                    query_collection_counterexample(context, &name, sort)
+                {
                     cex.role = role;
                     counterexamples.push(cex);
                     if let Some(bucket) = pin_bucket {
-                        bucket.extend(vec_pins);
+                        bucket.extend(coll_pins);
+                    }
+                }
+            }
+            // Tuple: fields come back `Poly`-boxed inside the constructor app, so
+            // reconstruct each via its field accessor + unbox (see helper).
+            TypX::Named(sort) if sort.starts_with("tuple%") => {
+                let rust_ty = context.counterexample_types.get(name.as_str()).cloned();
+                if let Some((mut cex, tup_pins)) =
+                    query_tuple_counterexample(context, &name, rust_ty.as_deref())
+                {
+                    cex.role = role;
+                    counterexamples.push(cex);
+                    if let Some(bucket) = pin_bucket {
+                        bucket.extend(tup_pins);
                     }
                 }
             }
@@ -323,7 +440,23 @@ pub(crate) fn gather_counterexamples(
         let _ = context.get_smt_process().send_commands(data);
     }
 
-    GatheredCounterexamples { counterexamples, input_pins, output_pins, instantiated: instantiation_pushed }
+    // Did instantiation change any collection value vs. the initial model?
+    let mut changed_by_instantiation = false;
+    for (name, pre) in &pre_values {
+        if let Some(post) = counterexamples.iter().find(|c| &c.var_name == name) {
+            if &post.var_value != pre {
+                changed_by_instantiation = true;
+            }
+        }
+    }
+
+    GatheredCounterexamples {
+        counterexamples,
+        input_pins,
+        output_pins,
+        instantiated: instantiation_pushed,
+        changed_by_instantiation,
+    }
 }
 
 /// Result of `gather_counterexamples`: the display values plus the role-split pins
@@ -336,20 +469,38 @@ pub(crate) struct GatheredCounterexamples {
     pub(crate) output_pins: Vec<String>,
     /// Whether the instantiation/materialization stage actually ran (for the trace).
     pub(crate) instantiated: bool,
+    /// Whether instantiation actually *changed* a collection value vs. the initial
+    /// model — i.e. the first counterexample was incoherent and this pipeline's
+    /// materialization corrected it (for the trace + tooling).
+    pub(crate) changed_by_instantiation: bool,
 }
 
-/// Reconstruct a `Vec` counterexample by querying the model, returning both the
-/// display `Counterexample` and the SMT equality terms (length + each element)
-/// that pin the vector back to its model value. The element type is parsed from
-/// the SMT sort string (e.g. `alloc!vec.Vec<u32./alloc!alloc.Global.>.`).
-fn query_vec_counterexample(
+/// Render one reconstructed element (an `Int` model value, already `clean_smt_
+/// value`-normalized) as Rust literal text for its element type. Chars come back
+/// as unicode codepoints and become `'A'`; everything else passes through.
+fn render_element(cleaned: &str, rust_elem_ty: &str) -> String {
+    if rust_elem_ty == "char" {
+        if let Ok(cp) = cleaned.parse::<u32>() {
+            if let Some(c) = char::from_u32(cp) {
+                return format!("'{}'", c.escape_default());
+            }
+        }
+    }
+    cleaned.to_string()
+}
+
+/// Reconstruct a collection (`Vec` / `String` / ghost `Seq`) counterexample by
+/// querying its `Seq` view, returning both the display `Counterexample` and the
+/// SMT equality terms (length + each element) that pin it back to its model
+/// value. This is the *one* element-walk shared by all three: the only per-kind
+/// differences are the `Seq`-view term (from `collection_view`) and how the
+/// element list is finally rendered (`vec![..]` / `"..."` / `[..]`).
+fn query_collection_counterexample(
     context: &mut Context,
     name: &str,
     sort: &str,
 ) -> Option<(Counterexample, Vec<String>)> {
-    // The Seq view of the Vec plus the element types, shared by the length and
-    // index queries (and by the instantiation materialization).
-    let (smt_elem_ty, rust_elem_ty, view) = vec_view_and_elem_ty(name, sort)?;
+    let (smt_elem_ty, rust_elem_ty, view, kind) = collection_view(name, sort)?;
 
     let len_term = format!("(vstd!seq.Seq.len.? $ {ety} {view})", ety = smt_elem_ty, view = view);
     let len_raw = context.eval_expr(parse_smt_term(&len_term));
@@ -360,7 +511,7 @@ fn query_vec_counterexample(
 
     let mut pins: Vec<String> = Vec::new();
     // Pin the length, then each element (mirrors the manual `let e0 = v[0]...`
-    // trick used in the ex4 example to force Z3 to materialize the Vec).
+    // trick used in the ex4 example to force Z3 to materialize the sequence).
     pins.push(format!("(= {} {})", len_term, clean_smt_value(&len_raw)));
 
     let mut elems: Vec<String> = Vec::new();
@@ -376,15 +527,116 @@ fn query_vec_counterexample(
         elems.push(clean_smt_value(&raw));
     }
 
+    // Render the element list per collection kind.
+    let (var_value, var_type) = match kind {
+        CollectionKind::Vec => {
+            let items =
+                elems.iter().map(|e| render_element(e, rust_elem_ty)).collect::<Vec<_>>();
+            (format!("vec![{}]", items.join(", ")), format!("Vec<{}>", rust_elem_ty))
+        }
+        CollectionKind::Seq => {
+            // Ghost Seq: elements are `int`/`nat` (or widths) — render as-is.
+            (format!("[{}]", elems.join(", ")), format!("Seq<{}>", rust_elem_ty))
+        }
+        CollectionKind::StringChars => {
+            // Rebuild the actual string from its char codepoints; `{:?}` yields a
+            // correctly-escaped Rust string literal (e.g. `"hi"`, `"\u{0}"`).
+            let s: String = elems
+                .iter()
+                .filter_map(|e| e.parse::<u32>().ok())
+                .filter_map(char::from_u32)
+                .collect();
+            (format!("{:?}", s), "String".to_string())
+        }
+    };
+
     let cex = Counterexample {
         var_name: name.to_string(),
-        var_value: format!("vec![{}]", elems.join(", ")),
-        var_type: Some(format!("Vec<{}>", rust_elem_ty)),
+        var_value,
+        var_type: Some(var_type),
         classification: None,
         role: None,
         stage_report: None,
     };
     Some((cex, pins))
+}
+
+/// Reconstruct a tuple counterexample. The model returns the tuple constant as a
+/// constructor application `tuple%N./tuple%N Poly!val!0 .. Poly!val!{N-1}` whose
+/// fields are opaque `Poly` boxes, so — mirroring the Vec `Seq.index` walk — each
+/// field is pulled out via its field accessor `(tuple%N./tuple%N/K p!)` and
+/// unboxed with `%I`. Field Rust types come from the pushed-down tuple type
+/// string (e.g. `(u32, char)`) so a `char` field renders `'A'`; absent that, all
+/// fields render as their raw integer value. Returns the display `Counterexample`
+/// plus per-field equality pins for refutation.
+fn query_tuple_counterexample(
+    context: &mut Context,
+    name: &str,
+    rust_ty: Option<&str>,
+) -> Option<(Counterexample, Vec<String>)> {
+    // Evaluate the tuple constant to recover its constructor name + arity.
+    let raw = context.eval_expr(parse_smt_term(name));
+    let cleaned = raw.trim();
+    let inner = cleaned.strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or(cleaned);
+    let tokens: Vec<&str> = inner.split_whitespace().collect();
+    let ctor = *tokens.first()?;
+    if !ctor.contains("./") {
+        return None;
+    }
+    let arity = tokens.len() - 1;
+    if arity == 0 {
+        return None;
+    }
+
+    // Per-field Rust types parsed from e.g. `(u32, char)`; empty if unavailable.
+    let field_tys: Vec<String> = rust_ty
+        .and_then(|t| t.strip_prefix('(').and_then(|s| s.strip_suffix(')')))
+        .map(|inner| split_top_level_commas(inner).into_iter().map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let mut pins: Vec<String> = Vec::new();
+    let mut rendered: Vec<String> = Vec::new();
+    for k in 0..arity {
+        let accessor = format!("({}/{} {})", ctor, k, name);
+        let elem_term = format!("(%I {})", accessor);
+        let fv = context.eval_expr(parse_smt_term(&elem_term));
+        pins.push(format!("(= {} {})", elem_term, fv.trim()));
+        let cleaned_fv = clean_smt_value(&fv);
+        let fty = field_tys.get(k).map(|s| s.as_str()).unwrap_or("");
+        rendered.push(render_element(&cleaned_fv, fty));
+    }
+
+    let cex = Counterexample {
+        var_name: name.to_string(),
+        var_value: format!("({})", rendered.join(", ")),
+        var_type: rust_ty.map(|s| s.to_string()),
+        classification: None,
+        role: None,
+        stage_report: None,
+    };
+    Some((cex, pins))
+}
+
+/// Split a string at top-level (bracket-depth 0) commas — for parsing a tuple
+/// type like `(u32, (i8, i8))` into its field types without breaking on nested
+/// commas.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let (mut depth, mut last) = (0i32, 0usize);
+    let mut out = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'<' | b'{' => depth += 1,
+            b')' | b']' | b'>' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[last..]);
+    out
 }
 
 #[derive(PartialEq, Eq)]
@@ -467,6 +719,7 @@ pub(crate) fn refine_and_classify(
     input_pins: &[String],
     output_pins: &[String],
     instantiated: bool,
+    changed_by_instantiation: bool,
     report: &mut Vec<String>,
 ) -> CexClassification {
     // Helper: dump the concrete witness terms that a stage pins, so the debug
@@ -492,6 +745,23 @@ pub(crate) fn refine_and_classify(
             "skipped (no Vec parameters to materialize)"
         }
     ));
+    // Surface whether instantiation actually *changed* the witness vs. the initial
+    // model. A machine-greppable marker ("Instantiation changed counterexample:
+    // yes/no") lets tooling flag the examples where this pipeline's materialization
+    // was load-bearing — the first (Stage 1) counterexample there was an
+    // incoherent/likely-spurious model that instantiation corrected.
+    if instantiated {
+        report.push(format!(
+            "      Instantiation changed counterexample: {}",
+            if changed_by_instantiation {
+                "yes (initial model was under-constrained; corrected by materialization)"
+            } else {
+                "no (initial model already coherent)"
+            }
+        ));
+    } else {
+        report.push("      Instantiation changed counterexample: n/a".to_string());
+    }
 
     if input_pins.is_empty() {
         report.push("Stage 3 — Refute: skipped (no input witness to pin).".to_string());
