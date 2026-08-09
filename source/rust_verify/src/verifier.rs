@@ -971,6 +971,24 @@ impl Verifier {
                                 eprintln!("\n=== Counterexample ===");
                                 eprintln!("Function: {:?}", context.fun);
                                 for cex in cex_values {
+                                    if cex.var_name
+                                        == air::context::NO_COUNTEREXAMPLE_EXTRACTED_MARKER
+                                    {
+                                        eprintln!(
+                                            "  (no counterexample values extracted — see \
+                                             extraction diagnostics in the pipeline trace below)"
+                                        );
+                                        continue;
+                                    }
+                                    if cex.var_name.starts_with(
+                                        air::context::STAGE1_RAW_WITNESS_PREFIX,
+                                    ) {
+                                        // Piggybacked Stage-1 raw witness (see
+                                        // `STAGE1_RAW_WITNESS_PREFIX`) — not part of the
+                                        // normal (Stage 2) display; used below only for
+                                        // the Stage-1 runtime-confirmation run.
+                                        continue;
+                                    }
                                     let clean_name = cex.var_name.trim_end_matches('!');
                                     // For vectors, also show the length for a clearer pretty-print.
                                     let is_vec = cex
@@ -1019,6 +1037,14 @@ impl Verifier {
                                     };
                                     for want in ["input", "output", "local"] {
                                         for cex in cex_values {
+                                            if cex.var_name
+                                                == air::context::NO_COUNTEREXAMPLE_EXTRACTED_MARKER
+                                                || cex.var_name.starts_with(
+                                                    air::context::STAGE1_RAW_WITNESS_PREFIX,
+                                                )
+                                            {
+                                                continue;
+                                            }
                                             if role_of(cex) == want {
                                                 let clean_name =
                                                     cex.var_name.trim_end_matches('!');
@@ -1798,10 +1824,69 @@ impl Verifier {
                             if self.args.counterexample && (want_gen || want_run) {
                                 if let Some(ref cex_values) = command_counterexamples {
                                     if let Some(source_path) = crate::counterexample_codegen::file_path_from_span(&function.span.as_string) {
+                                        // Compile + run one witness file, printing a labeled runtime-
+                                        // confirmation block. Shared by the Stage-2 (instantiated) and
+                                        // Stage-1 (raw, pre-instantiation) witnesses below so their
+                                        // ground-truth correctness can be compared stage-by-stage — see
+                                        // `TASKS_NEW.md` P2 ("progressively more correct" check).
+                                        let run_witness = |out_path: &std::path::Path, header: &str, verdict_label: &str| {
+                                            if let Ok(verus_exe) = std::env::current_exe() {
+                                                let compile_result = std::process::Command::new(&verus_exe)
+                                                    .arg("--compile")
+                                                    .arg(out_path)
+                                                    .output();
+                                                match compile_result {
+                                                    Ok(output) if output.status.success() => {
+                                                        let bin_name = out_path.file_stem().unwrap_or_default();
+                                                        let bin_path = std::env::current_dir()
+                                                            .unwrap_or_default()
+                                                            .join(bin_name);
+                                                        match std::process::Command::new(&bin_path).output() {
+                                                            Ok(run_out) => {
+                                                                let combined = format!(
+                                                                    "{}{}",
+                                                                    String::from_utf8_lossy(&run_out.stdout),
+                                                                    String::from_utf8_lossy(&run_out.stderr),
+                                                                );
+                                                                let verdict = if combined.contains("REAL BUG") {
+                                                                    "REAL (runtime-confirmed)"
+                                                                } else if combined.contains("SPURIOUS") {
+                                                                    "SPURIOUS (runtime-confirmed)"
+                                                                } else {
+                                                                    "INCONCLUSIVE (witness output unrecognized)"
+                                                                };
+                                                                eprintln!("\n{}", header);
+                                                                eprintln!("{}", combined.trim());
+                                                                eprintln!("=> Runtime verdict{}: {}", verdict_label, verdict);
+                                                                eprintln!("==========================================================");
+                                                                let _ = std::fs::remove_file(&bin_path);
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!("counterexample run error: {:?}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(output) => {
+                                                        eprintln!(
+                                                            "counterexample witness compile failed (Z3-side verdict stands):\n{}",
+                                                            String::from_utf8_lossy(&output.stderr),
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("counterexample compile error: {:?}", e);
+                                                    }
+                                                }
+                                            }
+                                        };
+
+                                        // --- Stage 2 (instantiated) witness: unchanged wording/behavior
+                                        // so existing tooling that greps "Runtime verdict (overrides
+                                        // Z3-side heuristic)" keeps working. ---
                                         match crate::counterexample_codegen::generate_test_file(
                                             function,
                                             cex_values,
                                             &source_path,
+                                            "",
                                         ) {
                                             Ok((out_path, content)) => {
                                                 if let Err(e) = std::fs::write(&out_path, &content) {
@@ -1811,58 +1896,16 @@ impl Verifier {
                                                     if want_run {
                                                         // T5(A): compile + run the witness and let its
                                                         // runtime verdict override the Z3-side heuristic.
-                                                        if let Ok(verus_exe) = std::env::current_exe() {
-                                                            let compile_result = std::process::Command::new(&verus_exe)
-                                                                .arg("--compile")
-                                                                .arg(&out_path)
-                                                                .output();
-                                                            match compile_result {
-                                                                Ok(output) if output.status.success() => {
-                                                                    let bin_name = out_path.file_stem().unwrap_or_default();
-                                                                    let bin_path = std::env::current_dir()
-                                                                        .unwrap_or_default()
-                                                                        .join(bin_name);
-                                                                    match std::process::Command::new(&bin_path).output() {
-                                                                        Ok(run_out) => {
-                                                                            let combined = format!(
-                                                                                "{}{}",
-                                                                                String::from_utf8_lossy(&run_out.stdout),
-                                                                                String::from_utf8_lossy(&run_out.stderr),
-                                                                            );
-                                                                            let verdict = if combined.contains("REAL BUG") {
-                                                                                "REAL (runtime-confirmed)"
-                                                                            } else if combined.contains("SPURIOUS") {
-                                                                                "SPURIOUS (runtime-confirmed)"
-                                                                            } else {
-                                                                                "INCONCLUSIVE (witness output unrecognized)"
-                                                                            };
-                                                                            eprintln!("\n=== Runtime Confirmation (executable-contract witness) ===");
-                                                                            eprintln!("{}", combined.trim());
-                                                                            eprintln!("=> Runtime verdict (overrides Z3-side heuristic): {}", verdict);
-                                                                            eprintln!("==========================================================");
-                                                                            let _ = std::fs::remove_file(&bin_path);
-                                                                        }
-                                                                        Err(e) => {
-                                                                            eprintln!("counterexample run error: {:?}", e);
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Ok(output) => {
-                                                                    eprintln!(
-                                                                        "counterexample witness compile failed (Z3-side verdict stands):\n{}",
-                                                                        String::from_utf8_lossy(&output.stderr),
-                                                                    );
-                                                                }
-                                                                Err(e) => {
-                                                                    eprintln!("counterexample compile error: {:?}", e);
-                                                                }
-                                                            }
-                                                        }
-                                                        // Clean up the witness file unless the user
-                                                        // also asked to keep it via --counterexample-gen-test.
-                                                        if !want_gen {
-                                                            let _ = std::fs::remove_file(&out_path);
-                                                        }
+                                                        run_witness(
+                                                            &out_path,
+                                                            "=== Runtime Confirmation (executable-contract witness) ===",
+                                                            " (overrides Z3-side heuristic)",
+                                                        );
+                                                    }
+                                                    // Clean up the witness file unless the user
+                                                    // also asked to keep it via --counterexample-gen-test.
+                                                    if !want_gen {
+                                                        let _ = std::fs::remove_file(&out_path);
                                                     }
                                                 }
                                             }
@@ -1872,6 +1915,61 @@ impl Verifier {
                                                 eprintln!("counterexample codegen skipped: {}", e);
                                                 if want_run {
                                                     eprintln!("=> Not runnable; Z3-side verdict stands (heuristic, no runtime confirmation possible).");
+                                                }
+                                            }
+                                        }
+
+                                        // --- Stage 1 (raw, pre-instantiation) witness: only exists
+                                        // (piggybacked, prefix-tagged) when instantiation actually ran;
+                                        // see `STAGE1_RAW_WITNESS_PREFIX`. Runtime-checking it too is
+                                        // what lets a benchmark run measure whether instantiation
+                                        // improves ground-truth correctness, not just presentation. ---
+                                        if want_run {
+                                            let raw_entries: Vec<air::context::Counterexample> = cex_values
+                                                .iter()
+                                                .filter(|c| {
+                                                    c.var_name.starts_with(
+                                                        air::context::STAGE1_RAW_WITNESS_PREFIX,
+                                                    )
+                                                })
+                                                .map(|c| air::context::Counterexample {
+                                                    var_name: c
+                                                        .var_name
+                                                        .trim_start_matches(
+                                                            air::context::STAGE1_RAW_WITNESS_PREFIX,
+                                                        )
+                                                        .to_string(),
+                                                    var_value: c.var_value.clone(),
+                                                    var_type: c.var_type.clone(),
+                                                    classification: c.classification,
+                                                    role: c.role,
+                                                    stage_report: None,
+                                                })
+                                                .collect();
+                                            if !raw_entries.is_empty() {
+                                                match crate::counterexample_codegen::generate_test_file(
+                                                    function,
+                                                    &raw_entries,
+                                                    &source_path,
+                                                    "_stage1raw",
+                                                ) {
+                                                    Ok((out_path, content)) => {
+                                                        if let Err(e) = std::fs::write(&out_path, &content) {
+                                                            eprintln!("counterexample codegen (Stage 1 raw): write error: {:?}", e);
+                                                        } else {
+                                                            run_witness(
+                                                                &out_path,
+                                                                "=== Runtime Confirmation (Stage 1 raw witness, pre-instantiation) ===",
+                                                                " (Stage 1 raw, pre-instantiation)",
+                                                            );
+                                                            if !want_gen {
+                                                                let _ = std::fs::remove_file(&out_path);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("counterexample codegen (Stage 1 raw) skipped: {}", e);
+                                                    }
                                                 }
                                             }
                                         }

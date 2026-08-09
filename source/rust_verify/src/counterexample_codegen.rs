@@ -61,6 +61,19 @@ pub fn typ_to_rust_string(typ: &Typ) -> String {
                 targs.iter().map(|t| typ_to_rust_string(t)).collect::<Vec<_>>().join(", ");
             format!("({})", fields)
         }
+        // `&T`/`Box<T>`/`Rc<T>`/`Arc<T>` are transparent wrappers around a value
+        // type. The witness redeclares the function under test taking params by
+        // value (its spliced-in `#[external_body]` copy of the original body
+        // works the same on an owned `Vec`/scalar as on a reference to one), so
+        // drop the wrapper and render the inner type instead of bailing out.
+        TypX::Decorate(
+            vir::ast::TypDecoration::Ref
+            | vir::ast::TypDecoration::Box
+            | vir::ast::TypDecoration::Rc
+            | vir::ast::TypDecoration::Arc,
+            _,
+            inner,
+        ) => typ_to_rust_string(inner),
         _ => "/* unsupported type */".to_string(),
     }
 }
@@ -111,9 +124,26 @@ fn get_fn_name(function: &FunctionSst) -> String {
 fn extract_source_parts(source: &str, fn_name: &str) -> Option<SourceParts> {
     let lines: Vec<&str> = source.lines().collect();
 
-    // Find the line with `fn <fn_name>`
+    // Find the line with `fn <fn_name>`. A plain substring search on `fn
+    // <fn_name>` false-positives whenever another function's name has
+    // `fn_name` as a prefix (e.g. `fn_name` = "count_frequency" also matches
+    // "fn count_frequency_spec(...)") — very common in this codebase's
+    // `xxx`/`xxx_spec` naming convention, and it silently grabs whichever of
+    // the two is defined first, extracting the wrong (often ensures-less)
+    // signature. Require a non-identifier character immediately after the
+    // name so only an exact match counts.
+    let needle = format!("fn {}", fn_name);
     let fn_line_idx = lines.iter().position(|l| {
-        l.contains(&format!("fn {}", fn_name)) && !l.trim().starts_with("//")
+        if l.trim().starts_with("//") {
+            return false;
+        }
+        match l.find(&needle) {
+            Some(pos) => l[pos + needle.len()..]
+                .chars()
+                .next()
+                .map_or(true, |c| !c.is_alphanumeric() && c != '_'),
+            None => false,
+        }
     })?;
 
     // Find requires/ensures clauses between fn signature and opening brace
@@ -237,6 +267,15 @@ fn fixup_ensures_for_exec(
     ret: &ParamInfo,
     params: &[ParamInfo],
 ) -> String {
+    // Only apply to actual scalar/integer promotion (the documented purpose).
+    // A viewed return type (`Vec<T>`/`String`) is already spec-typed as its
+    // `Seq` view in the generated macro body (see `spec_param_type`), so it
+    // needs no cast at all — appending `as Vec<T>` is both meaningless in spec
+    // code and, being a generic type, corrupts the later chained-inequality
+    // rewrite's naive `<`/`>` scan. Found via a `Vec<char>`-returning mutant.
+    if !is_scalar_type(&ret.typ_str) {
+        return ensures_text.to_string();
+    }
     // Only apply when return type differs from all param types
     let ret_type_differs = params.iter().all(|p| p.typ_str != ret.typ_str);
     if !ret_type_differs {
@@ -640,7 +679,14 @@ fn normalize_range_guard(guard: &str, vars: &[String]) -> String {
             terms.push(conj[last..].trim().to_string());
 
             // Need >= 2 ops (>= 3 terms) and every interior term a quant var.
-            let interior = &terms[1..terms.len().saturating_sub(1)];
+            // `terms.len() < 2` (no relational op matched at all) must bail out
+            // here, before ever slicing `terms[1..]` — otherwise a single-term
+            // conjunct (`terms.len() == 1`) makes that slice `[1..0]`, start >
+            // end, which panics.
+            if terms.len() < 2 {
+                return conj.to_string();
+            }
+            let interior = &terms[1..terms.len() - 1];
             let is_chain = chain_ops.len() >= 2
                 && !interior.is_empty()
                 && interior.iter().all(|t| vars.iter().any(|v| v == t));
@@ -741,6 +787,7 @@ pub fn generate_test_file(
     function: &FunctionSst,
     counterexamples: &[Counterexample],
     source_path: &Path,
+    file_suffix: &str,
 ) -> Result<(PathBuf, String), String> {
     let source =
         std::fs::read_to_string(source_path).map_err(|e| format!("read source: {:?}", e))?;
@@ -836,7 +883,8 @@ pub fn generate_test_file(
 
     // Generate output path
     let stem = source_path.file_stem().unwrap_or_default().to_string_lossy();
-    let output_path = source_path.with_file_name(format!("{}_counterexample_test.rs", stem));
+    let output_path =
+        source_path.with_file_name(format!("{}_counterexample_test{}.rs", stem, file_suffix));
 
     // Build the test file
     let mut out = String::new();
@@ -865,12 +913,17 @@ pub fn generate_test_file(
         &parts.requires_text,
         &vec_names,
     )));
+    // `fixup_ensures_for_exec` must run LAST: it appends `as <ret_type>`, and a
+    // generic return type (e.g. `Vec<char>`) contains `<`/`>` that
+    // `expand_chained_inequalities`'s naive operator scan would otherwise
+    // misparse as relational operators, corrupting the cast (`as Vec < char)
+    // && (char > )` — a real bug found via a `Vec<char>`-returning mutant).
     let ensures_stripped = strip_view_ops(&parts.ensures_text, &vec_names);
-    let ensures_body = expand_chained_inequalities(&commas_to_and(&fixup_ensures_for_exec(
-        &ensures_stripped,
+    let ensures_body = fixup_ensures_for_exec(
+        &expand_chained_inequalities(&commas_to_and(&ensures_stripped)),
         &ret,
         &params,
-    )));
+    );
 
     // Helper spec fns referenced by the contract must also be emitted (with
     // exec-compatible quantifiers) so the macro can generate their exec versions.

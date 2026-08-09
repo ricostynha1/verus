@@ -13,29 +13,31 @@
 //!
 //! 2. **Refinement** (`refine_and_classify`): decide whether the extracted
 //!    witness is a genuine failing input (REAL) or a solver artifact (SPURIOUS),
-//!    entirely on the Z3 side (no compile/run). Two stages, in order:
+//!    entirely on the Z3 side (no compile/run). Both stages pin the *concrete
+//!    counterexample values* back into the still-loaded failing query (which
+//!    already asserts the negation of the property) as plain ground equalities,
+//!    and re-run `check-sat`. Same polarity at both stages — `unsat` is the only
+//!    definitive signal, and it only ever proves SPURIOUS:
 //!
-//!    - **Refutation**: pin the *full* witness (every model constant, inputs and
-//!      the recomputed output) back into the failing query as strict equalities
-//!      and re-run `check-sat`. `unsat` => the witness cannot actually satisfy
-//!      the constraints (e.g. a non-linear-arithmetic guess whose output is
-//!      inconsistent with the body once the numbers are concrete) => SPURIOUS.
-//!      `sat` => the witness genuinely violates the property => REAL. Pinning the
-//!      full witness is what makes the "use the latest/true output" property
-//!      automatic: a bogus output contradicts the body and is refuted here,
-//!      before confirmation ever runs.
-//!    - **Confirmation** (only when refutation is `unknown`): assert that the
-//!      user function's post-condition *holds* under the pinned witness and
-//!      re-run `check-sat`. `unsat` => the post-condition provably cannot hold
-//!      for this witness => REAL. This turns the "is it real?" question into an
-//!      `unsat` proof, which the proof-oriented Z3 configuration answers cleanly
-//!      even when it will not commit to `sat` (the `unknown` wall).
+//!    - **Refutation**: pin the concrete **inputs** (`requires`-side) only.
+//!      `unsat` => the witness cannot actually satisfy the constraints once the
+//!      inputs are nailed down => SPURIOUS, and refinement stops here. Otherwise
+//!      (`sat`/`unknown`) proceed to Confirmation.
+//!    - **Confirmation**: additionally pin the concrete **output**
+//!      (`ensures`-side) — it never re-asserts the postcondition formula itself.
+//!      `unsat` => the exact (input, output) pair is inconsistent with the
+//!      failing query => SPURIOUS. `sat`/`unknown` => the pair stays consistent
+//!      with the property violation => REAL. In practice Verus's quantified
+//!      prelude runs with `smt.mbqi false`, tuned to prove `unsat`, so a genuine
+//!      witness surfaces as `unknown` rather than a clean `sat` — REAL is always
+//!      reached via this `sat`/`unknown` fallback, never proven by `unsat`.
 //!
 //!    Everything runs inside `push`/`pop` scopes so the solver state the caller
 //!    reuses for subsequent error localization is never corrupted.
 
 use crate::ast::{Typ, TypX};
 use crate::context::{CexClassification, Context, Counterexample, VarRole};
+use crate::counterexample_ablation::AblationArm;
 use crate::model::ModelDef;
 
 /// Parse an SMT term string into an s-expression node for `(eval ...)` / `(assert ...)`.
@@ -292,6 +294,8 @@ pub(crate) fn gather_counterexamples(
         .filter(|def| !def.name.starts_with("%%"))
         .map(|def| (def.name.to_string(), def.ret.clone()))
         .collect();
+    let candidates_total = candidates.len();
+    let arm = AblationArm::from_env();
 
     // Turn on model completion for the eval queries below.
     context.smt_log.log_set_option("model.completion", "true");
@@ -299,46 +303,41 @@ pub(crate) fn gather_counterexamples(
     let _ = context.get_smt_process().send_commands(opt_data);
 
     // --- Counterexample instantiation (SMT-level materialization) -------------
-    // For each Vec param — inputs AND outputs (the return value) — assert the
-    // two-part materialization (pin length + `has_type` per element). This forces
-    // Z3 to complete a *coherent* model, the analogue of the source `let e_i = v[i]`
-    // trick done entirely at the SMT level:
-    //   - on inputs, it fires the `sorted`/`upper_bound` requires-quantifiers so the
-    //     witness is precondition-valid;
-    //   - on outputs, it fires the body's `push` ensures-quantifiers so the returned
-    //     Vec's elements actually reflect `input ++ pushed values` instead of the
-    //     under-constrained junk Z3 leaves when the ground `Seq.index` terms are
-    //     absent.
-    // NOTE: materializing an output does NOT pin it for refutation — that is a
-    // separate decision below (`pin_value`), kept input-only so classification is
-    // not corrupted. The push scope stays open so the eval loop reads the refined
-    // model; it is popped before returning, restoring the caller's solver state.
+    // Materialize every Vec param — inputs AND outputs — via
+    // `vec_materialization_terms` (see its doc comment for the mechanism).
+    // Materializing an output does NOT pin it for refutation (kept input-only
+    // so classification isn't corrupted). The push scope stays open so the
+    // eval loop below reads the refined model; popped before returning.
+    // `arm.instantiate()` gates this off entirely for B0/B2.
     let mut materialize_terms: Vec<String> = Vec::new();
-    for def in model.iter() {
-        if def.params.len() != 0 || !def.name.ends_with('!') || def.name.starts_with("%%") {
-            continue;
-        }
-        if let TypX::Named(sort) = &*def.ret {
-            if sort.starts_with("alloc!vec.Vec<") {
-                if let Some(terms) = vec_materialization_terms(context, &def.name, sort) {
-                    materialize_terms.extend(terms);
+    if arm.instantiate() {
+        for def in model.iter() {
+            if def.params.len() != 0 || !def.name.ends_with('!') || def.name.starts_with("%%") {
+                continue;
+            }
+            if let TypX::Named(sort) = &*def.ret {
+                if sort.starts_with("alloc!vec.Vec<") {
+                    if let Some(terms) = vec_materialization_terms(context, &def.name, sort) {
+                        materialize_terms.extend(terms);
+                    }
                 }
             }
         }
     }
     let instantiation_pushed = !materialize_terms.is_empty();
 
-    // Before materializing, snapshot the *whole* input/output witness (every `!`
-    // param and the return binder — scalars, collections and tuples alike) as
-    // reconstructed from the *initial* (un-instantiated) model — the "first
-    // counterexample". After instantiation we compare against it: if ANY value
-    // changed, the first model was an under-constrained/incoherent (likely
-    // spurious) witness that the instantiation step corrected. Crucially this
-    // includes the OUTPUT: materializing the input+output Vecs fires the body's
-    // ensures-quantifiers, which can also change a scalar/derived output value —
-    // not just the collections themselves. These are exactly the cases where this
-    // pipeline's materialization was load-bearing rather than cosmetic.
+    // Snapshot every `!` param + return binder from the *initial* model before
+    // materializing, so the post-instantiation values below can be compared
+    // against it (`changed_by_instantiation`) — see that field's doc.
     let mut pre_values: Vec<(String, String)> = Vec::new();
+    // Raw-witness precondition check (Stage 0.5, see `refine_and_classify`'s doc):
+    // the same input-role SMT-pinnable equality terms Stage 3/4 will build below,
+    // but evaluated against the model as it stands *right now* — before
+    // instantiation materializes anything. Must be captured here, before the
+    // `log_push`/materialize block just below switches the solver into the
+    // post-instantiation state that the rest of this function (and the main
+    // per-candidate loop further down) reads from.
+    let mut raw_input_pins: Vec<String> = Vec::new();
     if instantiation_pushed {
         for def in model.iter() {
             if def.params.len() != 0 || !def.name.ends_with('!') || def.name.starts_with("%%") {
@@ -348,6 +347,7 @@ pub(crate) fn gather_counterexamples(
             let val = display_value_of(context, &def.name, &def.ret, rust_ty.as_deref());
             pre_values.push((def.name.to_string(), val));
         }
+        raw_input_pins = extract_input_pins(context, &candidates);
         context.smt_log.log_push();
         for t in &materialize_terms {
             context.smt_log.log_node(&parse_smt_term(&format!("(assert {})", t)));
@@ -358,15 +358,14 @@ pub(crate) fn gather_counterexamples(
     }
 
     let mut counterexamples: Vec<Counterexample> = Vec::new();
-    // Pins are split by role: refutation pins **inputs**; confirmation additionally
-    // pins **outputs**. Pinning outputs *together with* inputs is what makes the
-    // check a test of the *specific* witnessed (input, output) pair against the
-    // failing query (see `refine_and_classify`), instead of relying on the body —
-    // which is `TASKS`' "requires the concrete input / ensures the concrete output"
-    // shape. A concrete pair that is a genuine counterexample stays consistent
-    // (sat/unknown); a spurious one becomes `unsat` once fully pinned.
+    // Pins split by role: refutation pins inputs only; confirmation pins
+    // inputs+outputs (see `refine_and_classify`'s doc for why that split
+    // matters).
     let mut input_pins: Vec<String> = Vec::new();
     let mut output_pins: Vec<String> = Vec::new();
+    // Shape-recognized-but-extraction-failed candidates (name, reason) — see
+    // `GatheredCounterexamples::unsupported`'s doc.
+    let mut unsupported: Vec<(String, String)> = Vec::new();
     for (name, ret) in candidates {
         let is_param = name.ends_with('!');
         let role = context.counterexample_roles.get(name.as_str()).copied();
@@ -392,6 +391,13 @@ pub(crate) fn gather_counterexamples(
                     if let Some(bucket) = pin_bucket {
                         bucket.extend(coll_pins);
                     }
+                } else {
+                    unsupported.push((
+                        name.clone(),
+                        "Vec/String/Seq witness: could not determine a concrete length from \
+                         the model (non-numeric or negative Seq.len)"
+                            .to_string(),
+                    ));
                 }
             }
             // Tuple: fields come back `Poly`-boxed inside the constructor app, so
@@ -406,6 +412,13 @@ pub(crate) fn gather_counterexamples(
                     if let Some(bucket) = pin_bucket {
                         bucket.extend(tup_pins);
                     }
+                } else {
+                    unsupported.push((
+                        name.clone(),
+                        "tuple witness: model constructor pattern not recognized (unexpected \
+                         arity/ctor shape)"
+                            .to_string(),
+                    ));
                 }
             }
             _ => {
@@ -450,13 +463,83 @@ pub(crate) fn gather_counterexamples(
         }
     }
 
+    // Stage 1 as full `Counterexample`s — see `GatheredCounterexamples::
+    // raw_counterexamples`'s doc. Role/type looked up from the Stage-2 entry
+    // by name (only the value can differ between stages).
+    let mut raw_counterexamples: Vec<Counterexample> = Vec::new();
+    if instantiation_pushed {
+        for (name, val) in &pre_values {
+            let (var_type, role) = counterexamples
+                .iter()
+                .find(|c| &c.var_name == name)
+                .map(|c| (c.var_type.clone(), c.role))
+                .unwrap_or((None, None));
+            raw_counterexamples.push(Counterexample {
+                var_name: name.clone(),
+                var_value: val.clone(),
+                var_type,
+                classification: None,
+                role,
+                stage_report: None,
+            });
+        }
+    }
+
     GatheredCounterexamples {
         counterexamples,
         input_pins,
         output_pins,
+        raw_input_pins,
         instantiated: instantiation_pushed,
         changed_by_instantiation,
+        pre_instantiation_values: pre_values,
+        materialize_terms,
+        candidates_total,
+        unsupported,
+        raw_counterexamples,
     }
+}
+
+/// Extract just the SMT-pinnable equality terms for **input**-role candidates
+/// (output-role and `@` locals are skipped, matching `input_pins`'s own
+/// population rule in the main per-candidate loop above), evaluated against
+/// whatever solver state is currently active. The pin-only counterpart to
+/// that loop: no display `Counterexample`s are built, no `unsupported`
+/// diagnostics tracked — this exists solely so `gather_counterexamples` can
+/// call it twice against two different solver states (before and after the
+/// instantiation push) without duplicating the collection/tuple/scalar
+/// dispatch logic. See `raw_input_pins`'s doc for why the "before" call
+/// matters.
+fn extract_input_pins(context: &mut Context, candidates: &[(String, Typ)]) -> Vec<String> {
+    let mut input_pins: Vec<String> = Vec::new();
+    for (name, ret) in candidates {
+        if !name.ends_with('!') {
+            continue; // not a param — `@` locals are never pinned
+        }
+        if context.counterexample_roles.get(name.as_str()).copied() == Some(VarRole::Output) {
+            continue;
+        }
+        match &**ret {
+            TypX::Named(sort) if collection_view(name, sort).is_some() => {
+                if let Some((_, coll_pins)) = query_collection_counterexample(context, name, sort) {
+                    input_pins.extend(coll_pins);
+                }
+            }
+            TypX::Named(sort) if sort.starts_with("tuple%") => {
+                let rust_ty = context.counterexample_types.get(name.as_str()).cloned();
+                if let Some((_, tup_pins)) =
+                    query_tuple_counterexample(context, name, rust_ty.as_deref())
+                {
+                    input_pins.extend(tup_pins);
+                }
+            }
+            _ => {
+                let raw = context.eval_expr(parse_smt_term(name));
+                input_pins.push(format!("(= {} {})", name, raw.trim()));
+            }
+        }
+    }
+    input_pins
 }
 
 /// Result of `gather_counterexamples`: the display values plus the role-split pins
@@ -467,12 +550,46 @@ pub(crate) struct GatheredCounterexamples {
     pub(crate) input_pins: Vec<String>,
     /// Equality pins for the **output** witness (confirmation only).
     pub(crate) output_pins: Vec<String>,
+    /// Equality pins for the **input** witness, evaluated against the model
+    /// *before* instantiation materialized anything (empty unless instantiation
+    /// ran — see `instantiated`). Consumed by `refine_and_classify`'s Stage 0.5
+    /// (raw-witness precondition check): pinning these into the failing query
+    /// and re-checking `sat` tests whether the *raw* Stage-1 witness (what a
+    /// naive Stage-1-only tool would report) is coherent on its own terms,
+    /// independent of whether instantiation later produced a coherent one.
+    pub(crate) raw_input_pins: Vec<String>,
     /// Whether the instantiation/materialization stage actually ran (for the trace).
     pub(crate) instantiated: bool,
     /// Whether instantiation actually *changed* a collection value vs. the initial
     /// model — i.e. the first counterexample was incoherent and this pipeline's
     /// materialization corrected it (for the trace + tooling).
     pub(crate) changed_by_instantiation: bool,
+    /// The raw Stage-1 witness (every `!` param and the return binder), read from
+    /// the model *before* instantiation ran. Empty when instantiation didn't run.
+    /// Printed by `refine_and_classify` so the Stage-1 intermediary counterexample
+    /// is actually visible, not just whether it later changed.
+    pub(crate) pre_instantiation_values: Vec<(String, String)>,
+    /// The SMT-level ground terms asserted during Stage 2 materialization (length
+    /// pin + per-element `has_type`, for every `Vec`/`Seq` input and output) — the
+    /// Z3-nomenclature detail behind "instantiation changed the counterexample".
+    pub(crate) materialize_terms: Vec<String>,
+    /// Total number of zero-arity `!`/`@` model constants that matched the
+    /// extraction filter, before any per-candidate dispatch. If this is 0, the
+    /// failing query had no witnessed variables at all (not an extraction bug).
+    pub(crate) candidates_total: usize,
+    /// Candidates whose SMT sort was recognized as a collection/tuple shape but
+    /// whose value extraction still failed (name, reason) — these used to be
+    /// silently dropped with zero trace. A permanent diagnostic, unrelated to
+    /// `AblationArm` (which lives in its own module for the same isolation
+    /// reason this exists: keep evaluation concerns out of the normal path).
+    pub(crate) unsupported: Vec<(String, String)>,
+    /// Stage 1's raw (pre-instantiation) witness, as full `Counterexample`s
+    /// (same role/type as Stage-2, only the value can differ). Empty when
+    /// instantiation didn't run. Lets the caller runtime-check both stages'
+    /// witnesses against ground truth — see `smt_verify`'s use of
+    /// `context::STAGE1_RAW_WITNESS_PREFIX` to carry these across the
+    /// `ValidityResult` boundary.
+    pub(crate) raw_counterexamples: Vec<Counterexample>,
 }
 
 /// Render one reconstructed element (an `Int` model value, already `clean_smt_
@@ -685,72 +802,133 @@ impl std::fmt::Display for SatResult {
     }
 }
 
-/// The Z3-side refinement, run as the two witness-pinning stages of the pipeline.
-///
-/// Both stages pin the *concrete counterexample values* back into the still-loaded
-/// failing query (which already asserts the negation of the property) and re-check:
-///
-/// - **Refute** — pin the concrete **inputs** (`requires`-side). This is the
-///   "assume inputs" step: does the failing query stay satisfiable once the inputs
-///   are nailed to the witness?
-/// - **Confirm** — additionally pin the concrete **output** (`ensures`-side). This
-///   is the "assume inputs + output" step: does the *specific* witnessed
-///   (input, output) pair stay consistent with the failing query?
-///
-/// **Polarity (important, and empirically grounded):** Verus always runs Z3 with a
-/// large quantified prelude and `smt.mbqi false`, tuned to prove `unsat`. So a
-/// *genuine* counterexample's fully-pinned re-check does **not** return `sat` — it
-/// returns `unknown ("incomplete quantifiers")` (verified: this holds even for a
-/// hand-written `assume(input); …; assert(output)` source function, and even for
-/// unbounded `int`; unlike Dafny, whose lean query returns a clean `sat`). The one
-/// answer Z3 gives cleanly is `unsat`, which happens exactly when the pinned
-/// concrete witness is **inconsistent** — i.e. it cannot actually occur, so the
-/// counterexample is a solver artifact. Hence:
-///
-/// - `unsat`  → **Spurious** (the witness cannot occur), and
-/// - `sat` / `unknown` → **Real** (the concrete witness stays consistent with a
-///   genuine property violation).
-///
-/// This is what makes bare `assert` failures classify correctly too: they have no
-/// `ensures`/output to pin, so Confirm ≡ Refute, and a real assert failure's pinned
-/// input yields `unknown` → Real.
+impl SatResult {
+    /// Uppercase, no-annotation form for the `Z3 OUTCOME: ...` trace line.
+    fn outcome_word(&self) -> &'static str {
+        match self {
+            SatResult::Sat => "SAT",
+            SatResult::Unsat => "UNSAT",
+            SatResult::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// The Z3-side refinement (Stages 3-4): pin the witness back into the failing
+/// query and re-check `check-sat`. See the module doc comment (top of file)
+/// for the full mechanism and polarity (`unsat` ⇒ SPURIOUS at either stage;
+/// `sat`/`unknown` ⇒ REAL, never proven). One fact not covered there: bare
+/// `assert` failures have no `ensures`/output to pin, so Confirm ≡ Refute,
+/// and a real assert failure's pinned input yields `unknown` → REAL.
 pub(crate) fn refine_and_classify(
     context: &mut Context,
+    counterexamples: &[Counterexample],
     input_pins: &[String],
     output_pins: &[String],
+    raw_input_pins: &[String],
     instantiated: bool,
     changed_by_instantiation: bool,
+    pre_instantiation_values: &[(String, String)],
+    materialize_terms: &[String],
+    candidates_total: usize,
+    unsupported: &[(String, String)],
     report: &mut Vec<String>,
 ) -> CexClassification {
-    // Helper: dump the concrete witness terms that a stage pins, so the debug
-    // trace shows *exactly which counterexample* was fed to that stage's re-check.
+    let arm = AblationArm::from_env();
+    // Helper: dump the concrete witness terms that a stage pins (raw SMT-LIB, Z3
+    // nomenclature), so the trace shows exactly what was asserted at that stage.
     fn dump_pins(report: &mut Vec<String>, pins: &[String]) {
         if pins.is_empty() {
-            report.push("      (none)".to_string());
+            report.push("        (none)".to_string());
         }
         for p in pins {
-            report.push(format!("      pin: {}", p));
+            report.push(format!("        pin: {}", p));
         }
     }
 
+    // Helper: dump a witness in clean Verus/Rust form — `name = value`, one per
+    // line — from a list of (name, value) pairs (already-rendered display values).
+    fn dump_witness_pairs(report: &mut Vec<String>, entries: &[(String, String)]) {
+        if entries.is_empty() {
+            report.push("        (none)".to_string());
+        }
+        for (name, val) in entries {
+            report.push(format!("        {} = {}", name.trim_end_matches('!'), val));
+        }
+    }
+
+    // Helper: same, but reading straight from `Counterexample`s, optionally
+    // filtered by role (`None` filter = show everything, including `@` locals;
+    // `Some(f)` = only params where `f(role)` holds, matching what that stage
+    // actually pins).
+    fn dump_witness(
+        report: &mut Vec<String>,
+        counterexamples: &[Counterexample],
+        role_filter: Option<fn(Option<VarRole>) -> bool>,
+    ) {
+        let entries: Vec<(String, String)> = counterexamples
+            .iter()
+            .filter(|c| match role_filter {
+                None => true,
+                Some(f) => c.var_name.ends_with('!') && f(c.role),
+            })
+            .map(|c| (c.var_name.clone(), c.var_value.clone()))
+            .collect();
+        dump_witness_pairs(report, &entries);
+    }
+
+    // --- Stage 1 — Regular counterexample -----------------------------------
     report.push(
         "Stage 1 — Regular counterexample: read the initial model from the failing query."
             .to_string(),
     );
+    if instantiated {
+        // The model as first read, before any materialization — this is what
+        // Stage 2 below either keeps or corrects.
+        dump_witness_pairs(report, pre_instantiation_values);
+    } else {
+        // Nothing gets materialized, so Stage 1's witness is also the final one.
+        dump_witness(report, counterexamples, None);
+    }
+
+    // --- Extraction diagnostics: candidates found vs. actually extracted, so a
+    // benchmark run can grep "unsupported:" for stats on uncovered shapes. -----
+    if candidates_total == 0 {
+        report.push(
+            "Extraction: 0 candidate model constant(s) — this failing query has no \
+             witnessed `!`/`@` variables to report (nothing to extract, not an extractor bug)."
+                .to_string(),
+        );
+    } else {
+        report.push(format!(
+            "Extraction: {} candidate model constant(s) found; {} produced a counterexample \
+             value{}",
+            candidates_total,
+            counterexamples.len(),
+            if unsupported.is_empty() {
+                String::new()
+            } else {
+                format!(", {} unsupported (type/shape not handled by this extractor)", unsupported.len())
+            }
+        ));
+    }
+    for (name, reason) in unsupported {
+        report.push(format!("      unsupported: {} — {}", name.trim_end_matches('!'), reason));
+    }
+
+    // --- Stage 2 — Instantiate inputs/outputs --------------------------------
     report.push(format!(
         "Stage 2 — Instantiate inputs/outputs: {}",
         if instantiated {
-            "materialized Vec elements so the witness is concrete/coherent"
+            "materialized Vec/Seq elements so the witness is concrete/coherent"
         } else {
-            "skipped (no Vec parameters to materialize)"
+            "skipped (no Vec/Seq parameters to materialize)"
         }
     ));
-    // Surface whether instantiation actually *changed* the witness vs. the initial
-    // model. A machine-greppable marker ("Instantiation changed counterexample:
-    // yes/no") lets tooling flag the examples where this pipeline's materialization
-    // was load-bearing — the first (Stage 1) counterexample there was an
-    // incoherent/likely-spurious model that instantiation corrected.
     if instantiated {
+        report.push("      Counterexample after instantiation:".to_string());
+        dump_witness(report, counterexamples, None);
+        // Greppable "yes/no" marker so tooling can flag examples where
+        // materialization was load-bearing (see `changed_by_instantiation`'s doc).
         report.push(format!(
             "      Instantiation changed counterexample: {}",
             if changed_by_instantiation {
@@ -759,8 +937,35 @@ pub(crate) fn refine_and_classify(
                 "no (initial model already coherent)"
             }
         ));
+        report.push(
+            "      Z3-level terms asserted to materialize (length pin + per-index \
+             has_type):"
+                .to_string(),
+        );
+        dump_pins(report, materialize_terms);
     } else {
         report.push("      Instantiation changed counterexample: n/a".to_string());
+    }
+
+    // --- Ablation arm gate (see `counterexample_ablation`) — unset/B3 falls
+    // straight through unchanged; B0/B1 skip classification, always REAL. -----
+    if arm != AblationArm::B3 {
+        report.push(format!("Ablation arm: {}", arm.label()));
+    }
+    if !arm.classify() {
+        report.push(
+            "Stage 3 — Refute: skipped (ablation arm B0/B1: classification disabled by design)."
+                .to_string(),
+        );
+        report.push(
+            "Stage 4 — Confirm: skipped (ablation arm B0/B1: classification disabled by design)."
+                .to_string(),
+        );
+        report.push(
+            "=> Classification: REAL (ablation arm B0/B1 — always-REAL by design, not evidence)"
+                .to_string(),
+        );
+        return CexClassification::Real;
     }
 
     if input_pins.is_empty() {
@@ -774,12 +979,65 @@ pub(crate) fn refine_and_classify(
         return CexClassification::Inconclusive;
     }
 
-    // Stage 3 — Refute: pin the concrete INPUTS back into the failing query and
-    // re-run the verification.
+    // --- Stage 0.5 — Raw-witness precondition check (diagnostic only; never
+    // affects `CexClassification`) ----------------------------------------------
+    // Pins the SAME kind of concrete input values Stage 3 pins below, but the
+    // *raw* (pre-instantiation) ones — i.e. exactly what a naive Stage-1-only
+    // tool would have reported, before this pipeline's Stage 2 materialized any
+    // Vec/Seq elements. `unsat` here means the raw witness is already
+    // internally inconsistent with its own precondition, on its own terms,
+    // independent of whether Refute (Stage 3, on the *instantiated* witness)
+    // later proves anything — i.e. static, `unsat`-backed proof that
+    // instantiation was necessary to reach a witness coherent enough to
+    // evaluate at all, not merely a presentation nicety. Only meaningful when
+    // instantiation actually ran (raw and instantiated pins are identical
+    // otherwise, which would just duplicate Stage 3's own check) — gated the
+    // same way `pre_instantiation_values` is. See TASKS_IMPORTANT.md item 4.
+    if instantiated && !raw_input_pins.is_empty() {
+        report.push(format!(
+            "Stage 0.5 — Raw-witness precondition check: re-run verification with the {} \
+             concrete RAW (pre-instantiation) INPUT value(s) pinned:",
+            raw_input_pins.len()
+        ));
+        report.push("      Raw witness (Stage 1, before materialization):".to_string());
+        dump_witness_pairs(report, pre_instantiation_values);
+        report.push("      Z3-level pins asserted (raw values):".to_string());
+        dump_pins(report, raw_input_pins);
+        let raw_refute = check_sat_with(context, raw_input_pins);
+        report.push(format!("      check-sat = {}", raw_refute));
+        if raw_refute == SatResult::Unsat {
+            report.push(
+                "      => UNSAT: the raw Stage-1 witness's own concrete values are already \
+                 inconsistent with the precondition, BEFORE instantiation materialized \
+                 anything — instantiation was necessary to reach an evaluable witness at all, \
+                 not merely cosmetic."
+                    .to_string(),
+            );
+        } else {
+            report.push(
+                "      => still satisfiable (sat/unknown): the raw witness was already \
+                 internally coherent on its own terms; instantiation's contribution here is \
+                 presentation/runtime-compilability, not fixing an incoherent witness."
+                    .to_string(),
+            );
+        }
+        report.push(format!("      RAW WITNESS COHERENCE: {}", raw_refute.outcome_word()));
+        report.push(
+            "      (diagnostic only — does not affect Classification; see Stage 3/4 below for \
+             the actual REAL/SPURIOUS/INCONCLUSIVE call)"
+                .to_string(),
+        );
+    }
+
+    // --- Stage 3 — Refute: pin the concrete INPUTS back into the failing query
+    // and re-run the verification. ---------------------------------------------
     report.push(format!(
         "Stage 3 — Refute: re-run verification with the {} concrete INPUT value(s) pinned:",
         input_pins.len()
     ));
+    report.push("      Witness pinned at this stage (input only):".to_string());
+    dump_witness(report, counterexamples, Some(|role| role != Some(VarRole::Output)));
+    report.push("      Z3-level pins asserted:".to_string());
     dump_pins(report, input_pins);
     let refute = check_sat_with(context, input_pins);
     report.push(format!("      check-sat = {}", refute));
@@ -799,6 +1057,7 @@ pub(crate) fn refine_and_classify(
             "         failure. This witness is NOT a real counterexample — it is a solver artifact."
                 .to_string(),
         );
+        report.push(format!("      Z3 OUTCOME: {}", refute.outcome_word()));
         report.push("=> Classification: SPURIOUS".to_string());
         return CexClassification::Spurious;
     }
@@ -807,15 +1066,19 @@ pub(crate) fn refine_and_classify(
          witness; proceeding to Confirm."
             .to_string(),
     );
+    report.push(format!("      Z3 OUTCOME: {}", refute.outcome_word()));
 
-    // Stage 4 — Confirm: additionally pin the concrete OUTPUT and re-check the
-    // specific witnessed (input, output) pair.
+    // --- Stage 4 — Confirm: additionally pin the concrete OUTPUT and re-check the
+    // specific witnessed (input, output) pair. ----------------------------------
     let mut all_pins = input_pins.to_vec();
     all_pins.extend_from_slice(output_pins);
     report.push(format!(
         "Stage 4 — Confirm: re-run with inputs + the {} concrete OUTPUT value(s) pinned:",
         output_pins.len()
     ));
+    report.push("      Witness pinned at this stage (input + output):".to_string());
+    dump_witness(report, counterexamples, Some(|_role| true));
+    report.push("      Z3-level pins asserted:".to_string());
     dump_pins(report, &all_pins);
     let confirm = check_sat_with(context, &all_pins);
     report.push(format!("      check-sat = {}", confirm));
@@ -837,20 +1100,14 @@ pub(crate) fn refine_and_classify(
         // the concrete witness is a genuine counterexample.
         SatResult::Sat | SatResult::Unknown => {
             report.push(
-                "      => sat/unknown: the concrete (input, output) pair stays consistent with the"
+                "      => sat/unknown: the concrete (input, output) pair stays consistent with"
                     .to_string(),
             );
-            report.push(
-                "         property violation (Verus never returns a clean 'sat' here — its prelude"
-                    .to_string(),
-            );
-            report.push(
-                "         runs with mbqi off, so a genuine witness surfaces as 'unknown'). REAL."
-                    .to_string(),
-            );
+            report.push("         the property violation. REAL.".to_string());
             CexClassification::Real
         }
     };
+    report.push(format!("      Z3 OUTCOME: {}", confirm.outcome_word()));
     report.push(format!("=> Classification: {}", match class {
         CexClassification::Real => "REAL",
         CexClassification::Spurious => "SPURIOUS",

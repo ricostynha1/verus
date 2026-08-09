@@ -91,6 +91,25 @@ pub enum VarRole {
     Output,
 }
 
+/// Sentinel `Counterexample::var_name` used when extraction produced zero real
+/// witness values (see `air::smt_verify`'s use of it) — carries the per-stage
+/// pipeline trace (which explains why: extraction diagnostics, unsupported
+/// types, etc.) even when there is no actual witness to attach it to. The
+/// verifier's printer checks for this exact string to skip the normal
+/// name/value line and go straight to the trace.
+pub const NO_COUNTEREXAMPLE_EXTRACTED_MARKER: &str = "<no counterexample values extracted>";
+
+/// `Counterexample::var_name` prefix marking an entry as the Stage-1 **raw**
+/// (pre-instantiation) witness, piggybacked onto the same `Vec<Counterexample>`
+/// returned via `ValidityResult::Invalid` so it reaches `rust_verify`'s
+/// runtime-confirmation codegen without widening `ValidityResult`'s shape
+/// (which several call sites pattern-match at a fixed arity). Consumers must
+/// strip this prefix and treat the entry separately from the normal (Stage 2)
+/// witness — never display it as-is, and never feed it to codegen mixed in
+/// with the normal entries (its mangled name won't match a real param name
+/// anyway, so it's harmless if left in by accident, just useless).
+pub const STAGE1_RAW_WITNESS_PREFIX: &str = "\u{1}stage1-raw\u{1}";
+
 #[derive(Debug, Clone)]
 pub struct Counterexample {
     pub var_name : String,

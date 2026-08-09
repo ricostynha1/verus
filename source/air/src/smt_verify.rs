@@ -3,7 +3,10 @@ use crate::ast::{
     UnaryOp,
 };
 use crate::ast_util::{ident_var, mk_and, mk_not};
-use crate::context::{AssertionInfo, AxiomInfo, Context, ContextState, SmtSolver, ValidityResult};
+use crate::context::{
+    AssertionInfo, AxiomInfo, Context, ContextState, Counterexample,
+    NO_COUNTEREXAMPLE_EXTRACTED_MARKER, STAGE1_RAW_WITNESS_PREFIX, SmtSolver, ValidityResult,
+};
 use crate::def::{GLOBAL_PREFIX_LABEL, PREFIX_LABEL};
 use crate::messages::{ArcDynMessage, Diagnostics};
 pub use crate::model::{Model, ModelDef};
@@ -456,25 +459,61 @@ fn smt_get_model(
         mut counterexamples,
         input_pins,
         output_pins,
+        raw_input_pins,
         instantiated,
         changed_by_instantiation,
+        pre_instantiation_values,
+        materialize_terms,
+        candidates_total,
+        unsupported,
+        raw_counterexamples,
     } = crate::counterexample::gather_counterexamples(context, &model);
     let mut stage_report: Vec<String> = Vec::new();
     let classification = crate::counterexample::refine_and_classify(
         context,
+        &counterexamples,
         &input_pins,
         &output_pins,
+        &raw_input_pins,
         instantiated,
         changed_by_instantiation,
+        &pre_instantiation_values,
+        &materialize_terms,
+        candidates_total,
+        &unsupported,
         &mut stage_report,
     );
     for cex in counterexamples.iter_mut() {
         cex.classification = Some(classification);
     }
     // Attach the per-stage pipeline trace to the first counterexample only (it is
-    // the same trace for the whole model); the verifier prints it.
+    // the same trace for the whole model); the verifier prints it. If extraction
+    // produced zero counterexamples (e.g. every candidate was an unsupported
+    // type/shape), there is no "first" to attach to — push a sentinel entry so
+    // the trace (which explains why, via the extraction diagnostics above) isn't
+    // silently lost.
     if let Some(first) = counterexamples.first_mut() {
         first.stage_report = Some(stage_report);
+    } else {
+        counterexamples.push(Counterexample {
+            var_name: NO_COUNTEREXAMPLE_EXTRACTED_MARKER.to_string(),
+            var_value: String::new(),
+            var_type: None,
+            classification: Some(classification),
+            role: None,
+            stage_report: Some(stage_report),
+        });
+    }
+    // Piggyback the Stage-1 raw witness onto the end of the same Vec, prefixed
+    // so `rust_verify` can find it (for a second, Stage-1 runtime-confirmation
+    // run) without it polluting normal display or codegen matching — see
+    // `STAGE1_RAW_WITNESS_PREFIX`'s doc comment. Appended last so `.first()`
+    // (used for classification/stage_report display) is unaffected.
+    for raw in raw_counterexamples {
+        counterexamples.push(Counterexample {
+            var_name: format!("{}{}", STAGE1_RAW_WITNESS_PREFIX, raw.var_name),
+            ..raw
+        });
     }
 
     for info in infos.iter_mut() {
